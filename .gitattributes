@@ -1,0 +1,7 @@
+# Third-party font packages ship byte-for-byte as released (SIL OFL: an
+# altered component is a Modified Version), so Git never converts them.
+fonts/** -text
+
+# cmd misreads labels and goto in a batch file with LF line ends, so every
+# .bat is checked out with CRLF whatever core.autocrlf says (update.bat jumps).
+*.bat text eol=crlf

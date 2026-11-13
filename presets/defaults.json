@@ -1,0 +1,8 @@
+{
+  "default": "standard scaffold",
+  "machine_default": "MEWron 0.2",
+  "sweep_default": null,
+  "calibration_default": "MEWron 0.2 22G",
+  "machine_default_4axis": null,
+  "default_4axis": "Mandrel default"
+}

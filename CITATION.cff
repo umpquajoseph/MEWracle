@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use MEWracle in academic work, please cite it as below."
+title: MEWracle
+abstract: >-
+  The open-source platform for designing melt electrowriting (MEW) scaffolds
+  and modelling how they print, for any MEW printer. It designs scaffolds on a
+  flat collector or a rotating mandrel, writes the G-code, and models where
+  every fiber lands: fiber diameter, jet lag, coiling below the critical
+  speed, sagging between the fibers that hold a fiber up, and fusion into the
+  layer below. Each model can be calibrated to the user's printer and polymer.
+type: software
+version: 1.0.0-beta
+authors:
+  - family-names: Harris
+    given-names: Joseph
+    affiliation: >-
+      University of Oregon (work performed during an internship at Ohio State
+      University)
+repository-code: "https://github.com/umpquajoseph/MEWracle"
+license: AGPL-3.0-only
+keywords:
+  - melt electrowriting
+  - scaffold design
+  - G-code
+  - physical modelling

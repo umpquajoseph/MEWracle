@@ -1,0 +1,8 @@
+# Optional dependency for the Print History page. Install on top of
+# requirements.txt:  pip install -r installer/requirements-history.txt
+#
+# CSV run-sheet export and everything else in the history tab work with the core
+# deps (numpy + vtk, see requirements.txt) alone. reportlab is needed ONLY for the
+# PDF run sheet -- without it the "Export PDF" button is greyed out (mew_history
+# .HAS_REPORTLAB guards it) and CSV export still works. Pure-Python, no system deps.
+reportlab>=4.0

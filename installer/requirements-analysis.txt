@@ -1,0 +1,8 @@
+# Optional. Install on top of requirements.txt:
+#   pip install -r installer/requirements-analysis.txt
+# matplotlib draws the Print History graph and the micrograph scale window.
+# Without it the graph panel shows a hint and the runs list still works.
+matplotlib>=3.6
+# Pillow lets the Micrograph-overlay tab load JPG/TIFF/BMP (matplotlib reads PNG on
+# its own). Optional: without it the micrograph tab is limited to PNG.
+Pillow>=10.0

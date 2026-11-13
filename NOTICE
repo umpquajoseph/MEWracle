@@ -1,0 +1,32 @@
+MEWracle
+Copyright (C) 2026 Joseph Harris and contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License, in LICENSE, for
+more details.
+
+---
+
+THIRD-PARTY COMPONENTS
+
+three.js (lite/lite_web/vendor/three.module.js, three.core.js)
+    Copyright 2010-2026 Three.js Authors, MIT License.
+    https://github.com/mrdoob/three.js
+
+Liberation Fonts 2.1.5 (fonts/liberation-fonts-ttf-2.1.5/), whose Liberation
+    Sans is the user-interface typeface
+    Digitized data copyright (c) 2010 Google Corporation, with Reserved Font
+    Arimo, Tinos and Cousine. Copyright (c) 2012 Red Hat, Inc., with Reserved
+    Font Name Liberation. Distributed unmodified, as the complete upstream
+    release, under the SIL Open Font License 1.1; its text is in
+    fonts/liberation-fonts-ttf-2.1.5/LICENSE.
+    https://github.com/liberationfonts/liberation-fonts
+
+Runtime dependencies are installed from PyPI and are not redistributed here:
+NumPy (BSD-3-Clause), VTK (BSD-3-Clause), and the optional matplotlib
+(matplotlib license, BSD-compatible), Pillow (MIT-CMU) and ReportLab (BSD-3).

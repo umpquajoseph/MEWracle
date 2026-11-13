@@ -1,0 +1,65 @@
+__pycache__/
+*.pyc
+*.stl
+*.png
+*.bak
+
+# ...but these BUNDLED assets are source, not output, and the app breaks without
+# them: machine_models/ holds the printer meshes the player draws (the
+# printhead among them), Logo/ holds the window + taskbar icons, and assets/ holds
+# the tip pictures and the Physics page figures. They survive in
+# the development repo only because they were force-added there -- an ignore rule
+# does not affect an already-tracked file. A FRESH clone of this repo has no such
+# history, so without these negations `git add -A` silently skips them and the
+# published tree ships unrunnable. publish.py --check-ignored guards this.
+!printhead.stl
+!machine_models/**/*.stl
+!Logo/*.png
+!assets/tips/*.png
+!assets/physics/*.png
+!assets/readme/*.png
+
+# local install environment created by Install.bat / install.ps1
+.venv/
+
+# local test artifacts, not source
+outputs/
+# run_suites.py's ledger and capture_ui.py's shots
+.claude/
+*.preview.png
+
+# per-user GUI state -- input defaults ("Set as default"), dark-mode preference,
+# and the Machine-link connection settings (host / port / api key). Local
+# preferences, never committed.
+gui_defaults.json
+gui_prefs.json
+machine_link_prefs.json
+
+# per-user GUI presets. The SHIPPED ones -- presets/defaults.json's defaults and the
+# presets/scaffold/, presets/machine/ and presets/physics/ stores -- are source: every
+# default in presets/defaults.json names a file in them, and MEWracle.spec bundles
+# them for first-run seeding. Ignoring them made `git add -A` skip all of it.
+presets_sweep/
+presets/calibration/
+
+# per-user Print-history log: auto-recorded runs, the curated saved log, run
+# thumbnails, archived g-code copies.
+history/
+
+# per-user machine-model profile -- it points at local STL part files, like a
+# preset. The GUI writes its own to the session dir and passes it via --machine.
+machine.json
+!_diagnostics/collector_conformance/fixtures/machine.json
+
+# build output. MEWracle.spec IS tracked; build/ and dist/ are regenerable.
+build/
+dist/
+
+# scratch and scratch caches
+_scratch/
+scratch/
+_inv.*
+scaffolds.json
+zzz*.scaffolds.json
+.perf/
+

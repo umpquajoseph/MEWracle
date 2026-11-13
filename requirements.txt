@@ -1,0 +1,12 @@
+# Core MEW scaffold / g-code -> fiber-STL pipeline.
+# This is all you need for the "G-code -> STL" and "Scaffold -> STL" tabs,
+# the STL viewer, and the g-code player.
+numpy>=1.24
+vtk>=9.2
+
+# Optional extras, each its own list in installer/:
+#   installer/requirements-analysis.txt  -- Print History graph, micrograph
+#                                          scale window, JPG/TIFF micrographs
+#   installer/requirements-history.txt   -- the Print History PDF run sheet
+
+# (The optional String-Art tab was removed 2026-07-01.)
