@@ -4,6 +4,8 @@
 
 Design a scaffold, and MEWracle writes the G-code and shows you where every fiber will land: how far the jet trails the nozzle, how much each fiber sags between crossings, and how far it fuses into the layer below. Calibrate it on your printer, and those predictions are for your machine.
 
+![MEWracle at work: a scaffold designed, regenerated as a circle and moved, then printed fiber by fiber in the simulated printer](assets/readme/demo.gif)
+
 ![The Design page: a ten-layer scaffold drawn as 3-D fibers, with looped turns around its edges](assets/readme/design-tubes.webp)
 
 ## From design to print
