@@ -3671,6 +3671,43 @@ class Player:
         diam = self.jet_state.fiber_diameter if self.jet_state is not None else 0.02
         return contact, diam
 
+    def _note_live_lag(self, contact):
+        """Record the INSTANTANEOUS lag for the readout: the distance on the bed
+        from the nozzle to the contact the jet is drawn to this frame.
+
+        The steady solve's `lag_angle_deg` is the lag of a long straight line at
+        the current feed; it does not know the path, so it read the same through
+        a linking loop as on a straight. The contact, though, is already placed
+        by the ray tracker (`mew_deposition`/`mew_live`), which cuts inside a loop
+        smaller than the lag, so its distance to the nozzle is the lag the jet
+        actually has. Reusing the point the jet drawing just found adds one
+        distance per frame and no second lookup.
+
+        Both points are in the deposited cache's own frame (on a mandrel, the
+        collector's), before any scene seat or spin. On the flat plate the
+        distance is horizontal; on a collector surface it is the 3-D chord, since
+        "on the bed" there is the surface itself."""
+        if self.n_pts < 2:
+            return
+        seg, frac = self._cursor()
+        nozzle = self.verts[seg] + frac * (self.verts[seg + 1] - self.verts[seg])
+        d = np.asarray(contact, float) - nozzle
+        self._live_lag_mm = float(np.hypot(d[0], d[1]) if self._frame is None
+                                  else np.linalg.norm(d))
+
+    def _lag_readout(self):
+        """(angle text, mm text) of the instantaneous lag for every readout, the
+        angle over the model's working distance -- the same conversion the steady
+        solve uses, so a straight reads what it always read. ("--", "") on a frame
+        that draws no jet (the lead-in gate, the parked end)."""
+        lag = getattr(self, "_live_lag_mm", None)
+        if lag is None:
+            return "--", ""
+        gap = (self.model.working_distance if self.model is not None
+               else self.standoff)
+        deg = math.degrees(math.atan2(lag, gap)) if gap > 0.0 else 0.0
+        return f"{deg:.0f}", f"{lag:.1f} mm"
+
     def _lead_in_jet_gate(self, verts, is_dep):
         """Print-time before which NO jet is drawn -- the lead-in approach that
         flies in from beside the collector.
@@ -4074,6 +4111,7 @@ class Player:
             # lean. z comes from the cache too (the LANDED height), so the jet
             # meets the fibre where it actually rests.
             contact, cdiam = self._jet_contact()
+            self._note_live_lag(contact)
             # the contact is a point ON the drawn fibre, so it takes the same seat
             # and spin the fibre's actor does -- measured off the geometry, it
             # would otherwise anchor the jet to an unspun point
@@ -4644,6 +4682,9 @@ class Player:
         vtxt = None
         if js is not None:
             d_um = self._fiber_diameter_um(js)
+            # the INSTANTANEOUS lag (nozzle to contact), not the steady solve's
+            # straight-line js.lag_angle_deg -- see _note_live_lag
+            lag_deg, lag_mm = self._lag_readout()
             # flag the print-speed scale only when the user has moved it off 1.0,
             # so the displayed v is recognisably a what-if rather than the feed
             scale = (f" x{self.print_speed_scale:.2f}"
@@ -4688,7 +4729,7 @@ class Player:
                     vtxt,
                     f"d {d_um:.0f} um",
                     f"CTS {js.critical_speed:.1f}   v/CTS {js.speed_ratio:.2f}",
-                    f"lag {js.lag_angle_deg:.0f} deg   [{js.regime.value}]"]
+                    f"lag {lag_deg} deg {lag_mm}   [{js.regime.value}]"]
             text = "\n".join(lines)
             self.hud.SetInput(text)
             # the same fields as labelled rows, for the embedded rail's table
@@ -4724,7 +4765,8 @@ class Player:
                      "v": "%s %s" % q("fiber_d", d_um / 1000.0, "mm")},
                     {"g": "", "k": "CTS",
                      "v": f"{cts_s} {_cu} · v/CTS {js.speed_ratio:.2f}"},
-                    {"g": "", "k": "Jet lag", "v": f"{js.lag_angle_deg:.0f}°"}]
+                    {"g": "", "k": "Jet lag",
+                     "v": f"{lag_deg}° · {lag_mm}" if lag_mm else f"{lag_deg}°"}]
             self._readout_rows, self._readout_text = rows, text
             if self._dev_error:
                 # a HUD that differs from the readout text is the rail's status
@@ -4742,7 +4784,7 @@ class Player:
                     f"T={self.temperature:.0f}C  {vtxt} "
                     f"|  d={d_um:.0f}um  "
                     f"CTS={js.critical_speed:.1f}  v/CTS={js.speed_ratio:.2f}  "
-                    f"lag={js.lag_angle_deg:.0f}deg  [{js.regime.value}] ")
+                    f"lag={lag_deg}deg {lag_mm}  [{js.regime.value}] ")
         if self._dev_error:
             txt = f" {self._dev_error}\n{txt}"
         self.hud.SetInput(txt)
@@ -5526,6 +5568,7 @@ class Player:
         tip_world = np.asarray(sc["tip_world"], float)
         if self._jet_t is not None and self.t < self.total and self.t >= self._jet_on:
             contact, cdiam = self._jet_contact()
+            self._note_live_lag(contact)
             # the contact is a point ON the revealed fibre, so it takes the reveal
             # group's shift, not the bed's -- and its spin, on a mandrel
             contact = self._to_scene(contact, overlay, self._rot_deg)
@@ -7556,6 +7599,9 @@ class Player:
         self.active_actor.GetProperty().SetColor(
             *(DEPOSIT_COLOR if is_dep_seg else TRAVEL_COLOR))
 
+        # cleared here and re-set by the jet placement below, so a frame that
+        # draws no jet reads no lag rather than the previous frame's
+        self._live_lag_mm = None
         self._place_head_and_jet(head)
 
         if self.slider is not None and not self._sync_slider:

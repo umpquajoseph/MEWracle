@@ -45,7 +45,7 @@ import math
 import numpy as np
 
 from mew_physics import (ProcessParams, coil_offset_series,
-                         integrate_contact_path_ray)
+                         integrate_contact_path_ray, ray_settle_time)
 from mew_coil_wave import below_cts_runs, coil_wave_reshape, overlay_wave_runs
 # loop_entry_flags is pure geometry (numpy only -- gcode_to_fibers pulls no VTK at
 # import), so importing it keeps a SINGLE source of truth for "does this fibre begin
@@ -1668,10 +1668,11 @@ def _lay_one(p, t, seg_len, dt, v_seg, v_eff, lag_of, zeta, settle_taus,
     # speed change -- where the touchdown actually curves. Straight interiors keep
     # their own (sparse) sampling because the contact there is just a constant
     # offset line, which two endpoints already capture. That holds only while the
-    # tracker's INPUT is constant across the interior. Under a mandrel
-    # `placement` the lateral offset relaxes for `transient_taus` * tau after the
-    # corner -- the SAME window this fill covers, and by then exp(-t/tau) has run
-    # out -- so the sparse remainder is constant again. The relaxation itself is
+    # tracker's INPUT is constant across the interior AND its output has settled.
+    # Under a mandrel `placement` the lateral offset relaxes for `transient_taus` *
+    # tau after the corner -- covered by the tau window, by when exp(-t/tau) has run
+    # out. The contact itself settles more slowly, on `ray_settle_time`, so the
+    # window continues on that clock (below). The offset relaxation is
     # grid-independent (`_relax_offsets`), so refining moves it by nothing.
     step = tau_min / fill_per_tau
     extra = []
@@ -1708,8 +1709,18 @@ def _lay_one(p, t, seg_len, dt, v_seg, v_eff, lag_of, zeta, settle_taus,
     # unchanged); rises with the corner count so one big single-fibre serpentine or
     # unit-cell tube resolves every corner. Used for BOTH the coil-grid clamp and
     # the final thinning below.
+    # The catch-up SETTLES on the ray tracker's own time constant, not on tau
+    # (`mew_physics.ray_settle_time`): ~5x tau on a mandrel helix, ~2x on a flat
+    # pass. The tau window above resolves the corner's rounding; past it the
+    # window carries on at the settle clock's own step until the contact has
+    # settled too, so the sparse interior that follows really is a constant-offset
+    # line. Without it the last fill sample sat ~0.03 mm short of the settled lag
+    # and the interior interpolated that up to the far vertex as a straight ramp.
+    ray_c = model.lag_ray_constants() if model is not None else None
     per_corner = max(_MIN_FILL_PER_CORNER,
                      int(math.ceil(transient_taus * fill_per_tau)))
+    if ray_c is not None:
+        per_corner += int(math.ceil(transient_taus * fill_per_tau))
     cap = max(max_points_per_fiber, n + len(corners) * per_corner)
     for ci, k in enumerate(corners):          # k indexes the interval to fill into
         # The catch-up out of a corner rings for transient_taus*tau, which can OUTLAST
@@ -1730,6 +1741,17 @@ def _lay_one(p, t, seg_len, dt, v_seg, v_eff, lag_of, zeta, settle_taus,
         m = int((win_end - t[k]) / step + 1e-9) if step > 0.0 else 0
         if m > 0:
             extra.append(t[k] + step * np.arange(1, m + 1))
+        # ...and on to the settle clock's window (see `per_corner` above)
+        if ray_c is not None:
+            t_set = ray_settle_time(tau_seg[k] * v_seg[k], v_seg[k],
+                                    lag_ceiling=ray_c[0],
+                                    saturation_exp=ray_c[2])
+            set_end = min(t[k] + transient_taus * t_set, t[nxt])
+            if t_set > tau_seg[k] and set_end > win_end:
+                s_step = t_set / fill_per_tau
+                ms = int((set_end - win_end) / s_step + 1e-9)
+                if ms > 0:
+                    extra.append(win_end + s_step * np.arange(1, ms + 1))
     rt = (np.unique(np.concatenate([t] + extra)) if extra else t.copy())
 
     # Settle tail: hold the nozzle at the last point for a few tau so the trailing

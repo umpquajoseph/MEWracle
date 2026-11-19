@@ -51,7 +51,7 @@ from collections import namedtuple
 import numpy as np
 
 from mew_physics import (ProcessParams, coil_offset_series,
-                         integrate_contact_path_ray)
+                         integrate_contact_path_ray, ray_settle_time)
 from mew_coil_wave import below_cts_runs, coil_wave_reshape, overlay_wave_runs
 
 # Accel-limited re-timing (optional; off by default so a plain re-lay is the
@@ -626,21 +626,29 @@ def _relay_one(p, t, model, gap, schedule, zeta, coil, solve_cache, cts_cache,
     # past (see module note). Windows extend to t[-1], not the next vertex, so a
     # transient that outlasts a short interval is still resolved.
     bp_times = schedule.breakpoint_times_in(float(t[0]), float(t[-1]))
-    events = [(float(t[k]), tau_seg[k]) for k in _corner_vertices(p, v_seg)]
+    events = [(float(t[k]), tau_seg[k], v_seg[k])
+              for k in _corner_vertices(p, v_seg)]
     for tb in bp_times:
         kb = int(np.clip(np.searchsorted(t, tb, side="right") - 1, 0, n - 2))
         events.append((tb, _tau_at(model, gap, schedule.params_at(tb),
-                                   v_seg[kb], solve_cache, cts_cache, v_eff[kb])))
+                                   v_seg[kb], solve_cache, cts_cache, v_eff[kb]),
+                       v_seg[kb]))
     # Adaptive per-fibre budget: keep at least _MIN_FILL_PER_CORNER samples per
     # transient event (geometry corner / speed change / schedule breakpoint) so the
     # corner-rounding fill is never thinned into a blocky polygon. Floored by the flat
     # cap (small fibres unchanged); rises with the event count so one big single-fibre
     # serpentine resolves every loop. Used for the coil-grid clamp and the final thin.
-    cap = max(max_points_per_fiber, n + len(events) * _MIN_FILL_PER_CORNER)
+    # Each event's window also runs on to the ray tracker's SETTLE clock
+    # (`mew_physics.ray_settle_time`), which outlasts tau -- ~5x on a mandrel helix
+    # -- so its budget carries that second fill too. Mirrors mew_deposition._lay_one.
+    ray_c = model.lag_ray_constants()
+    cap = max(max_points_per_fiber,
+              n + len(events) * (_MIN_FILL_PER_CORNER
+                                 + int(math.ceil(transient_taus * fill_per_tau))))
     # the breakpoint instants themselves become grid nodes, so the param step lands
     # exactly there (the straddling sub-interval doesn't carry the old tau past it)
     extra = [np.asarray(bp_times, dtype=np.float64)] if bp_times else []
-    for te, tau_e in events:
+    for te, tau_e, v_e in events:
         if tau_e <= 0.0:                   # below-CTS / pinned: straight, no fill
             continue
         step = tau_e / fill_per_tau
@@ -650,6 +658,17 @@ def _relay_one(p, t, model, gap, schedule, zeta, coil, solve_cache, cts_cache,
         m = int((win_end - te) / step + 1e-9) if step > 0.0 else 0
         if m > 0:
             extra.append(te + step * np.arange(1, m + 1))
+        # the catch-up settles on the ray clock, not on tau: keep filling, at that
+        # clock's own step, until it has (the sparse interior after it is then a
+        # true constant-offset line, not an interpolated unfinished recovery)
+        t_set = ray_settle_time(tau_e * v_e, v_e, lag_ceiling=ray_c[0],
+                                saturation_exp=ray_c[2])
+        set_end = min(te + transient_taus * t_set, float(t[-1]))
+        if t_set > tau_e and set_end > win_end:
+            s_step = t_set / fill_per_tau
+            ms = int((set_end - win_end) / s_step + 1e-9)
+            if ms > 0:
+                extra.append(win_end + s_step * np.arange(1, ms + 1))
     rt = np.unique(np.concatenate([t] + extra)) if extra else t.copy()
 
     # Settle tail: hold the nozzle at the last point for a few tau so the trailing

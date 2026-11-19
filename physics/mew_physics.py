@@ -1589,6 +1589,26 @@ RAY_SUBSTEPS = 16
 RAY_STEPS_PER_TAU = 96.0
 
 
+def ray_settle_time(lag_mm, speed, *, lag_ceiling, saturation_exp):
+    """The time constant on which `integrate_contact_path_ray` settles onto a
+    steady lag `lag_mm` at nozzle `speed` -- NOT the lag time `tau = lag/speed`.
+
+    Near the steady lag the ray step is dL/dt = v - V_JCP(L), and V_JCP is the lag
+    law inverted, K * ((amp - L)/span) ** (-1/b) with K fixed by V_JCP(L_ss) = v.
+    Linearised, the deficit decays at dV_JCP/dL = v / (b * (amp - L_ss)), so the
+    time constant is b * (amp - L_ss) / v. It does not depend on the floor L0, and
+    because amp >> L_ss it barely depends on the lag either: about 0.25 s at
+    13 mm/s on the default rig, where tau is 0.05 s on a mandrel helix and 0.11 s
+    on a flat pass. A refine window sized in tau alone therefore ends before the
+    contact has settled, and the sparse remainder interpolates the unfinished
+    recovery as a straight ramp (reported: the lag climbing steadily along every
+    straight helix pass on the default mandrel). 0 when there is nothing to settle."""
+    if not (speed > 0.0) or not (lag_mm > 0.0):
+        return 0.0
+    return float(saturation_exp) * max(float(lag_ceiling) - float(lag_mm), 0.0) \
+        / float(speed)
+
+
 def integrate_contact_path_ray(points, times, relax_times, *, lag_ceiling,
                                lag_floor=0.0, saturation_exp,
                                substeps=None, steps_per_tau=None,
