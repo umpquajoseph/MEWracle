@@ -2871,6 +2871,15 @@ class Document:
         fl = get_flavor(self.flavor)
         exportish = form in ("export", "internal")
         ending = "\r\n" if "\r\n" in self.base_text else "\n"
+        # the parse form leaves out comment-only, option and block-comment
+        # lines; one the user typed over still needs its place there, or the
+        # typing vanishes from the picture with the line it replaced
+        # (select all, type `G1 X15 Y2`: the start block's first comment
+        # took it, and the preview had no moves to draw). Such a line is
+        # kept as an empty placeholder its edit fills; any left are dropped
+        want = set() if form != "parse" else {
+            tuple(c.at) for c in self.changes
+            if c.on and isinstance(c, LineEdit) and c.at and c.op != "delete"}
         slots, unplaced = self._compose(ending)
         for c in self.changes:
             if not c.on:
@@ -2934,10 +2943,10 @@ class Document:
                 before.setdefault(i, []).append(rl)
             else:
                 after.setdefault(i, []).append(rl)
-        if exportish:
+        if exportish or ("opt", "wait_temp") in want:
             line = wait_temp_line(self.options.wait_temp, fl)
             if line:
-                top.append(RLine(line, "option",
+                top.append(RLine(line if exportish else "", "option",
                                  "opt:wait_temp", (), True,
                                  ("opt", "wait_temp")))
         for pl in self._placements(slots, index, walk, fl, ending, unplaced):
@@ -2945,6 +2954,9 @@ class Document:
                 if form == "parse":
                     ln = strip_comment(ln, fl.comment).strip()
                     if not ln:
+                        if tuple(uid) in want:
+                            put(pl["pos"], RLine("", origin, chip, (), ro,
+                                                 uid))
                         continue
                 put(pl["pos"], RLine(ln + ending, origin, chip, (), ro, uid))
         out = []
@@ -2956,11 +2968,15 @@ class Document:
                    if c.on and isinstance(c, LineEdit) and c.shift
                    and not c.at}
         marks = []
-        layer_at = self._layer_marker_lines(slots, fl) if exportish else {}
+        layer_at = self._layer_marker_lines(slots, fl) \
+            if exportish or any(w[:2] == ("opt", "layer") for w in want) \
+            else {}
         for i, s in enumerate(slots):
             for j, t in enumerate(layer_at.get(i, ())):
-                out.append(RLine(t + ending, "option", "opt:layer", (), True,
-                                 ("opt", "layer", i, j)))
+                if exportish or ("opt", "layer", i, j) in want:
+                    out.append(RLine(t + ending if exportish else "",
+                                     "option", "opt:layer", (), True,
+                                     ("opt", "layer", i, j)))
             out += before.get(i, ())
             if s.key and tuple(s.key) in shifted:
                 marks.append((len(out), shifted[tuple(s.key)]))
@@ -2970,6 +2986,9 @@ class Document:
                     text = strip_comment(text, fl.comment).strip()
                     text = (text + ending) if text else ""
                 parts = _split_text_lines(text) if text else []
+                if not parts and form == "parse" and tuple(s.uid) in want:
+                    out.append(RLine("", s.origin, s.chip, s.key,
+                                     s.readonly, s.uid))
                 for j, part in enumerate(parts):
                     out.append(RLine(part, s.origin, s.chip,
                                      s.key if j == 0 else (),
@@ -3004,7 +3023,7 @@ class Document:
         # every line but the last ends with a newline
         for k in range(len(out) - 1):
             t = out[k].text
-            if not t.endswith(("\n", "\r")):
+            if t and not t.endswith(("\n", "\r")):
                 out[k] = RLine(t + ending, out[k].origin, out[k].chip,
                                out[k].key, out[k].readonly, out[k].uid)
         if form == "parse" and fl.aliases:
@@ -3030,6 +3049,11 @@ class Document:
             out.insert(0, RLine(("G76" if self.feed_unit == "s" else "G75")
                                 + ending, "flavor", "flavor", (), True,
                                 ("flavor", "time_base")))
+        if form == "parse" and self.options.custom_line is not None \
+                and ("opt", "custom_line") in want:
+            out.insert(min(int(self.options.custom_line[1]), len(out)),
+                       RLine("", "option", "opt:custom_line", (), True,
+                             ("opt", "custom_line")))
         if exportish and self.options.custom_line is not None:
             cl, after_n = self.options.custom_line
             if out and not out[-1].text.endswith(("\n", "\r")):
@@ -3044,13 +3068,17 @@ class Document:
                 text = render_machine_block(block, self.options.context, fl)
                 result = []
                 for i, ln in enumerate(text.splitlines(keepends=True)):
+                    key = (("machine", "header", -1, -1, -1, i)
+                           if name == "start" else ())
                     if form == "parse":
                         ln = strip_comment(ln, fl.comment).strip()
                         if not ln:
+                            if ("machine", name, i) in want:
+                                result.append(RLine(
+                                    "", "machine", "machine:" + name, key,
+                                    True, ("machine", name, i)))
                             continue
                         ln = read_line(ln, fl) + ending
-                    key = (("machine", "header", -1, -1, -1, i)
-                           if name == "start" else ())
                     result.append(RLine(ln, "machine", "machine:" + name,
                                         key, True, ("machine", name, i)))
                 return result
@@ -3064,6 +3092,10 @@ class Document:
         if form == "export" and fl.line_numbers:
             out = [RLine("N%d %s" % (k + 1, o.text), o.origin, o.chip, o.key,
                          o.readonly, o.uid) for k, o in enumerate(out)]
+        if want:
+            out = [o for o in out if o.text]        # unfilled placeholders
+        if form == "parse":
+            out = _reader_dwells(out, fl)
         seen = set()
         unplaced = [u for u in unplaced if not (u in seen or seen.add(u))]
         return Rendered("".join(o.text for o in out), out, unplaced, form)
@@ -4086,17 +4118,41 @@ class Document:
             elif self.parent_id(c) and c.op == "repeat":
                 pls += self._repeat_copies(c, pls, slots, index, walk, fl)
         pls += self._block_copies(pls, slots)
-        for c in self.changes:
+        # a move reaches the lines that were there when it was made, as it
+        # does the generated lines (applied in list order): lines typed
+        # after it were typed where the page already showed them moved, so
+        # moving them again put `G1 X0 Y0` off the zero by the move. An
+        # automatic script is not in the design, has no place in the order,
+        # and every move reaches it, as before.
+        order = {c.id: k for k, c in enumerate(self.changes)
+                 if not str(c.id).startswith("rig:")}
+        for k, c in enumerate(self.changes):
             if not isinstance(c, Transform) or c.op not in _GEOMETRIC \
                     or c.op == "repeat" or not self._shown(c):
                 continue
             ids, at, everywhere = self._scope_reach(c.scope, slots, index)
             for pl in pls:
                 where, i = pl["pos"]
-                if pl["chip"] in ids or everywhere or (
-                        where in ("before", "after") and i in at):
+                if pl["chip"] in ids or ((everywhere or (
+                        where in ("before", "after") and i in at))
+                        and order.get(pl["chip"], -1) < k):
                     self._op_on_lines(pl, c, walk)
         return pls
+
+    def _moved_since(self, cid):
+        """True when a geometric operation (a move, scale, rotate...) was
+        made after change `cid`. Its lines are then shown moved, so typing
+        into them is kept as typed (an edit on the rendered line, or a new
+        Insert) rather than written into `cid`, which the move would carry
+        off again."""
+        seen = False
+        for c in self.changes:
+            if c.id == cid:
+                seen = True
+            elif seen and isinstance(c, Transform) and c.op in _GEOMETRIC \
+                    and c.op != "repeat" and c.on and not self.parent_id(c):
+                return True
+        return False
 
     @staticmethod
     def _block_copies(pls, slots):
@@ -4524,6 +4580,8 @@ class Document:
             return self._rule_line_edit(rl, new, res)
         if rl.readonly:
             return self._at_edit(rl, new, res, shift)
+        if rl.origin == "insert" and self._moved_since(rl.chip):
+            return self._at_edit(rl, new, res, shift)
         if rl.origin == "insert":
             c = self._ins_chip(rl)
             c.lines[rl.uid[2]] = new
@@ -4543,6 +4601,8 @@ class Document:
     def _edit_base_line(self, rl, old, new, res):
         patch = word_patch(old, new)
         prev = self._edit_for(rl.key)
+        if prev is not None and self._moved_since(prev.id):
+            return self._at_edit(rl, new, res)
         if patch is not None and (prev is None or prev.op == "words"):
             set_, drop = patch
             if prev is None:
@@ -4606,6 +4666,10 @@ class Document:
         one layer is ONE chip -- the whole layer reads "Removed layer 3" --
         instead of one "removed line" chip per line."""
         run = []
+        # an Insert's lines go last and from the bottom: each is deleted by
+        # its index in the chip, and deleting the first of two shifts the
+        # second off the end (select-all + type crashed record_edit)
+        typed = []
 
         def flush():
             if len(run) > 1:
@@ -4622,9 +4686,14 @@ class Document:
             flush()
             if self._blockable(rl):
                 run.append(rl)
+            elif rl.origin == "insert" and not rl.readonly \
+                    and self._at_edit_for(rl.uid) is None:
+                typed.append(rl)
             else:
                 self._delete_line(rl, res)
         flush()
+        for rl in sorted(typed, key=lambda r: r.uid[2], reverse=True):
+            self._delete_line(rl, res)
 
     def _delete_block(self, old, run, res):
         gone = {}
@@ -4718,14 +4787,16 @@ class Document:
         lines, shift = self._inbound_new(old, at, lines)
         prev = old[at - 1] if at > 0 else None
         nxt = old[at] if at < len(old) else None
-        if prev is not None and prev.origin == "insert":
+        if prev is not None and prev.origin == "insert" \
+                and not self._moved_since(prev.chip):
             c = self._ins_chip(prev)
             j = prev.uid[2] + 1
             c.lines[j:j] = list(lines)
             self._add_shift(c, shift)
             _mark(res.changed, c.id)
             return
-        if nxt is not None and nxt.origin == "insert":
+        if nxt is not None and nxt.origin == "insert" \
+                and not self._moved_since(nxt.chip):
             c = self._ins_chip(nxt)
             j = nxt.uid[2]
             c.lines[j:j] = list(lines)
@@ -6062,6 +6133,11 @@ def dwell_seconds(words, flavor="klipper"):
     when both are given); GRBL's P is SECONDS."""
     fl = get_flavor(flavor)
     try:
+        # the flavor's own dwell word and unit first: what the G-code
+        # flavors menu says this controller reads
+        if fl.dwell_word and fl.dwell_unit and fl.dwell_word in words:
+            v = float(words[fl.dwell_word])
+            return v / 1000.0 if fl.dwell_unit == "ms" else v
         if fl.name == "grbl":
             return float(words["P"]) if "P" in words else None
         if "S" in words and fl.name != "klipper":
@@ -6071,6 +6147,26 @@ def dwell_seconds(words, flavor="klipper"):
     except ValueError:
         return None
     return None
+
+
+def _reader_dwells(out, fl):
+    """The parse form's dwells in the readers' one spelling, ``G4 P<ms>``:
+    the player, the converter and the preview read P as milliseconds, while
+    the flavor's own word and unit (the G-code flavors menu) may say S
+    seconds, or P seconds (GRBL)."""
+    cmds = {"G4", canon_cmd(fl.dwell_cmd or "G4")}
+    res = []
+    for o in out:
+        body = o.text.rstrip("\r\n")
+        cmd, words = parse_words(body, fl.comment)
+        if cmd and canon_cmd(cmd) in cmds:
+            s = dwell_seconds(words, fl)
+            if s is not None and s >= 0:
+                o = RLine("G4 P%s" % fmt_num(s * 1000.0, 3)
+                          + o.text[len(body):], o.origin, o.chip, o.key,
+                          o.readonly, o.uid)
+        res.append(o)
+    return res
 
 
 def convert_line(line, src, dst):

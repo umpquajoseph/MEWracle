@@ -360,6 +360,26 @@ def _arc_step_deg(arc_segments):
 _ARC_STEP_DEG = _arc_step_deg(_DEFAULT_ARC_SEGMENTS)   # 22.5 deg fallback
 
 
+def dwell_seconds_of(tokens):
+    """Seconds a ``G4`` with these word tokens holds the nozzle still: P in
+    milliseconds, S in seconds (S wins), as Klipper, Marlin and RepRapFirmware
+    read them and as the G-code page's parse form always writes a dwell
+    (`mew_gcode._reader_dwells`, from the flavor's own word and unit). 0.0 for
+    none. The jet keeps flowing through it: only the clock moves."""
+    p = s = None
+    for tok in tokens:
+        try:
+            v = float(tok[1:])
+        except ValueError:
+            continue
+        if tok[:1] in "Pp":
+            p = v
+        elif tok[:1] in "Ss":
+            s = v
+    secs = s if s is not None else (p / 1000.0 if p is not None else 0.0)
+    return secs if secs > 0.0 else 0.0
+
+
 def arc_xy_points(sx, sy, ex, ey, i, j, cw, step_deg=_ARC_STEP_DEG):
     """Discretise a G2/G3 circular arc into XY points, EXCLUDING the start and
     INCLUDING the exact endpoint.
@@ -1132,6 +1152,21 @@ def parse_gcode(path, mode="auto", with_times=False, arc_segments=None,
             if split_rot and code in ("G75", "G76"):
                 split = True
                 per = 60.0 if code == "G76" else 1.0
+                continue
+            if code in ("G4", "G04"):
+                # a dwell: the nozzle holds still and the clock runs on, as
+                # `gcode_player.parse_path` times it, so the two clocks agree.
+                # The fibre ends here and the next move opens a new one at
+                # the same point, after the dwell: one fibre cannot carry two
+                # times at one point (the sag solvers and the mesh dedupe it,
+                # keeping the first), and its times interpolated across the
+                # dwell grew the fibre along the next move while the nozzle
+                # held still. The designer writes no G4, so only a hand-made
+                # dwell splits a fibre
+                secs = dwell_seconds_of(tokens[1:])
+                if secs > 0.0:
+                    flush()
+                    t_cum += secs
                 continue
             if code in ("G20", "G020"):
                 # every length below is read as mm; an inch file drawn that
@@ -7950,61 +7985,96 @@ def _hex_to_rgb255(s):
         return None
 
 
-def path_colors_from_groups(groups, n_paths, default_rgb):
-    """Map each of `n_paths` g-code paths (one per layer, in g-code order) to its
-    scaffold's RGB colour from a --scaffold-groups list (each entry may carry a
-    hex "color"). Returns a list of (r,g,b) uint8 tuples of length n_paths, or None
-    when colourisation does not apply -- `groups`/`default_rgb` falsy, layer counts
-    that do not sum to n_paths, or no group carrying a usable colour -- so the
-    caller keeps its single solid colour. A group without a valid colour uses
-    `default_rgb`."""
-    if not groups or default_rgb is None:
+def dwell_continued(paths, tol=1e-6):
+    """Indices of the fibres that RESUME the fibre before them after a dwell.
+
+    `parse_gcode` ends a fibre at a `G4` and opens the next at the same point
+    after the dwell, so one layer can arrive as several fibres. Such a fibre is
+    exactly one whose FIRST vertex is the previous fibre's LAST vertex: every
+    other break (a G0 that moves, a non-printing arc, a travel) leaves from
+    somewhere else. Computed on the COMMANDED paths, as `loop_entry_flags` is:
+    the physics transform and the sag solve move the vertices."""
+    out = set()
+    prev = None
+    for i, p in enumerate(paths):
+        p = np.asarray(p, dtype=np.float64)
+        if (prev is not None and len(p) and len(prev)
+                and float(np.max(np.abs(p[0] - prev[-1]))) < tol):
+            out.add(i)
+        prev = p
+    return out
+
+
+def path_group_index(groups, n_paths, continued=()):
+    """The scaffold group of each of `n_paths` g-code paths: one LAYER per
+    group layer, in g-code order, where a path in `continued` (see
+    `dwell_continued`) carries on the layer before it. A list of group indices,
+    or None when the layer counts do not match the paths -- so every caller
+    falls back to its single diameter / colour, as before. The one mapping the
+    colours, the diameters and the per-scaffold STLs share."""
+    if not groups:
         return None
+    continued = {i for i in (continued or ()) if 0 < i < n_paths}
     try:
-        if sum(int(g["layers"]) for g in groups) != n_paths:
-            return None
+        layers = [int(g["layers"]) for g in groups]
     except (KeyError, ValueError, TypeError):
         return None
-    grp_rgb = [_hex_to_rgb255(g.get("color")) for g in groups]
-    if not any(c is not None for c in grp_rgb):
-        return None                         # nothing to colour -> stay solid
-    out, gi, left = [], 0, int(groups[0]["layers"])
-    for _ in range(n_paths):
+    if sum(layers) != n_paths - len(continued):
+        return None
+    out, gi, left = [], 0, layers[0]
+    for i in range(n_paths):
+        if i in continued:
+            out.append(out[-1])
+            continue
         while left <= 0 and gi + 1 < len(groups):
             gi += 1
-            left = int(groups[gi]["layers"])
-        out.append(grp_rgb[gi] if grp_rgb[gi] is not None else tuple(default_rgb))
+            left = layers[gi]
+        out.append(gi)
         left -= 1
     return out
 
 
-def path_diameters_from_groups(groups, n_paths, default_diam):
-    """Map each of `n_paths` g-code paths (one per layer, in g-code order) to its
-    scaffold's fiber_diameter from a --scaffold-groups list (each entry a dict
-    with "layers" and optional positive "fiber_diameter"). Returns a list of
-    length n_paths, or None when `groups` is falsy OR its layer counts don't sum
-    to n_paths -- so callers fall back to the uniform `default_diam` exactly as
-    before. A group without a positive fiber_diameter also falls back per path."""
-    if not groups:
+def path_colors_from_groups(groups, n_paths, default_rgb, continued=()):
+    """Map each of `n_paths` g-code paths (one per layer, in g-code order; a
+    path in `continued` resumes its layer after a dwell) to its scaffold's RGB
+    colour from a --scaffold-groups list (each entry may carry a hex "color").
+    Returns a list of (r,g,b) uint8 tuples of length n_paths, or None when
+    colourisation does not apply -- `groups`/`default_rgb` falsy, layer counts
+    that do not match the paths, or no group carrying a usable colour -- so the
+    caller keeps its single solid colour. A group without a valid colour uses
+    `default_rgb`."""
+    if not groups or default_rgb is None:
         return None
-    try:
-        if sum(int(g["layers"]) for g in groups) != n_paths:
-            return None
-        out = []
-        gi, left = 0, int(groups[0]["layers"])
-        for _ in range(n_paths):
-            while left <= 0 and gi + 1 < len(groups):
-                gi += 1
-                left = int(groups[gi]["layers"])
-            try:
-                gd = float(groups[gi].get("fiber_diameter", 0.0))
-            except (TypeError, ValueError):
-                gd = 0.0
-            out.append(gd if gd > 0.0 else default_diam)
-            left -= 1
-        return out
-    except (KeyError, ValueError, TypeError):
+    gidx = path_group_index(groups, n_paths, continued)
+    if gidx is None:
         return None
+    grp_rgb = [_hex_to_rgb255(g.get("color")) for g in groups]
+    if not any(c is not None for c in grp_rgb):
+        return None                         # nothing to colour -> stay solid
+    return [grp_rgb[gi] if grp_rgb[gi] is not None else tuple(default_rgb)
+            for gi in gidx]
+
+
+def path_diameters_from_groups(groups, n_paths, default_diam, continued=()):
+    """Map each of `n_paths` g-code paths (one per layer, in g-code order; a
+    path in `continued` resumes its layer after a dwell) to its scaffold's
+    fiber_diameter from a --scaffold-groups list (each entry a dict with
+    "layers" and optional positive "fiber_diameter"). Returns a list of length
+    n_paths, or None when `groups` is falsy OR its layer counts don't match the
+    paths -- so callers fall back to the uniform `default_diam` exactly as
+    before. A group without a positive fiber_diameter also falls back per
+    path."""
+    gidx = path_group_index(groups, n_paths, continued)
+    if gidx is None:
+        return None
+    out = []
+    for gi in gidx:
+        try:
+            gd = float(groups[gi].get("fiber_diameter", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            gd = 0.0
+        out.append(gd if gd > 0.0 else default_diam)
+    return out
 
 
 def build_deposition_mesh(gcode_path, diameter=0.02, faces=12, mode="auto",
@@ -8068,6 +8138,8 @@ def build_deposition_mesh(gcode_path, diameter=0.02, faces=12, mode="auto",
     # transform seam rounds the loop's closure) so the player's no-cache
     # fallback sags loop entries identically to the exported STL.
     loop_entry = loop_entry_flags(paths)
+    # a fibre a dwell split off carries on its layer's group (commanded paths)
+    continued = dwell_continued(paths)
 
     # Fibre-transform seam, exactly as main() applies it: with a transform
     # installed the mesh is built on the LAID centreline, not the commanded one.
@@ -8092,9 +8164,10 @@ def build_deposition_mesh(gcode_path, diameter=0.02, faces=12, mode="auto",
 
     # per-scaffold fiber diameters / colours (multi-scaffold files); None -> the
     # uniform single diameter / a single solid colour, exactly as before
-    path_diam = path_diameters_from_groups(scaffold_groups, len(paths), diameter)
+    path_diam = path_diameters_from_groups(scaffold_groups, len(paths), diameter,
+                                           continued)
     path_color = path_colors_from_groups(scaffold_groups, len(paths),
-                                         scaffold_default_rgb)
+                                         scaffold_default_rgb, continued)
     sag_diam = min(path_diam) if path_diam else diameter
 
     applicable, _n_layers = _sag_applicable(paths, sag_diam,
@@ -9373,6 +9446,7 @@ def _main(argv=None):
     # parse branch on the COMMANDED paths, before any transform rounds the closure).
     # None in the --from-depo branch (the cache is already sagged -- no solve).
     loop_entry = None
+    continued = set()       # the dwell splits; set in the parse branch too
     if args.from_depo:
         # On-demand exact build: load the already-sagged (already fibre-transformed)
         # fibres from the cache; skip parse + transform + sag (and don't rewrite the
@@ -9468,6 +9542,9 @@ def _main(argv=None):
         # rounds that closure away. Carried into apply_sag so a loop's entry stays
         # continuous with the layer beneath instead of severing one diameter up.
         loop_entry = loop_entry_flags(paths)
+        # ...and the fibres a dwell split off, which carry on their layer's
+        # scaffold group (`dwell_continued`), on the same commanded paths
+        continued = dwell_continued(paths)
 
         # Optional fibre-transform seam (None on the plain CLI): the
         # physics layer reshapes the commanded centrelines into the jet's trailing
@@ -9625,8 +9702,9 @@ def _main(argv=None):
     # --- per-scaffold grouping --------------------------------------------- #
     # Resolved BEFORE sagging because each scaffold may sag at its OWN fiber
     # diameter. A group index for each parsed path (one path per layer, in
-    # g-code order); sum(layers) must match the path count, else the mapping is
-    # unreliable -> fall back to no parts (one merged STL, global diameter).
+    # g-code order, a dwell's split carrying on its layer: `path_group_index`);
+    # the layers must match the paths, else the mapping is unreliable -> fall
+    # back to no parts (one merged STL, global diameter).
     groups = None
     path_group = None
     if args.scaffold_groups:
@@ -9635,21 +9713,12 @@ def _main(argv=None):
         except ValueError:
             groups = None
         if groups:
-            want = sum(int(g["layers"]) for g in groups)
-            if want != len(paths):
-                print(f"  note: scaffold groups cover {want} path(s) but the "
-                      f"file has {len(paths)} -- skipping per-scaffold parts",
-                      file=sys.stderr)
+            path_group = path_group_index(groups, len(paths), continued)
+            if path_group is None:
+                print(f"  note: scaffold groups do not match the file's "
+                      f"{len(paths) - len(continued)} layer(s) -- skipping "
+                      f"per-scaffold parts", file=sys.stderr)
                 groups = None
-        if groups:
-            path_group = []
-            gi, left = 0, int(groups[0]["layers"])
-            for _ in range(len(paths)):
-                while left <= 0 and gi + 1 < len(groups):
-                    gi += 1
-                    left = int(groups[gi]["layers"])
-                path_group.append(gi)
-                left -= 1
 
     # A --from-depo rebuild is launched WITHOUT --scaffold-groups, but the .depo
     # stored the per-fibre grouping. Recover it so the per-scaffold sibling STLs

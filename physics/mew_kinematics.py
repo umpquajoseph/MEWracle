@@ -237,7 +237,13 @@ class Trajectory:
         s_base = 0.0
         for i, m in enumerate(self.moves):
             t0 = self.times[i]
-            if m.length <= 1e-12:                # null move: no motion, no time
+            if m.length <= 1e-12:                # null move: no motion
+                if m.duration > 1e-12:           # ...but a dwell's time
+                    times.append(t0 + m.duration)
+                    points.append(m.start)
+                    speeds.append(0.0)
+                    arcs.append(s_base)
+                    seg.append(i)
                 continue
             local = []                           # local sample times, ascending
             if m.t_acc > 1e-12:
@@ -270,7 +276,7 @@ def plan_trajectory(points, seg_feeds, max_accel: float = None,
                     square_corner_velocity: float = None,
                     curvature_limit: bool = True,
                     entry_v: float = 0.0, exit_v: float = 0.0,
-                    seg_accel=None) -> Trajectory:
+                    seg_accel=None, seg_dwell=None) -> Trajectory:
     """Plan the accel-limited trajectory for a polyline.
 
     Args:
@@ -299,6 +305,11 @@ def plan_trajectory(points, seg_feeds, max_accel: float = None,
                     ``square_corner_velocity`` set; each corner then spends the
                     lower of its two moves' accelerations. Ignored when
                     ``max_accel`` <= 0 (planning off).
+        seg_dwell:  None (default), or N-1 seconds, one per segment: a G4 dwell
+                    is a segment that goes nowhere (zero length) and holds the
+                    head still that long. The head stops on both sides of it,
+                    as the controller drains its queue before a G4. Ignored on
+                    a segment with length.
 
     Returns a `Trajectory`. With N < 2 (nothing to move) it is empty-but-valid.
     """
@@ -313,6 +324,12 @@ def plan_trajectory(points, seg_feeds, max_accel: float = None,
 
     P = [(float(p[0]), float(p[1]), float(p[2])) for p in points]
     nseg = n - 1
+    dwell = [0.0] * nseg
+    if seg_dwell is not None:
+        if len(seg_dwell) != nseg:
+            raise ValueError("seg_dwell needs one value per segment: %d vs %d"
+                             % (len(seg_dwell), nseg))
+        dwell = [max(float(x), 0.0) for x in seg_dwell]
 
     if max_accel <= 0.0:
         # Explicitly OFF: honour the documented contract (module docstring,
@@ -340,6 +357,14 @@ def plan_trajectory(points, seg_feeds, max_accel: float = None,
         for i in range(nseg):
             vc, L = cruise[i], length[i]
             if L <= 1e-12:                          # null move: passes no time
+                if dwell[i] > 0.0:                  # ...unless it is a dwell
+                    t_cum += dwell[i]
+                    moves.append(Move(length=0.0, cruise_v=vc, entry_v=0.0,
+                                      exit_v=0.0, peak_v=0.0, t_acc=0.0,
+                                      t_cruise=dwell[i], t_dec=0.0,
+                                      start=P[i], unit=unit[i]))
+                    times[i + 1] = t_cum
+                    continue
                 moves.append(Move(length=0.0, cruise_v=vc, entry_v=vc, exit_v=vc,
                                   peak_v=vc, t_acc=0.0, t_cruise=0.0, t_dec=0.0,
                                   start=P[i], unit=unit[i]))
@@ -414,6 +439,11 @@ def plan_trajectory(points, seg_feeds, max_accel: float = None,
             if vcp < c[k]:
                 c[k] = vcp
 
+    # a dwell stops the head on both sides of it
+    for k in range(nseg):
+        if dwell[k] > 0.0 and length[k] <= 1e-12:
+            c[k] = c[k + 1] = 0.0
+
     # forward pass (acceleration limit) then backward pass (deceleration limit)
     for k in range(1, nseg + 1):
         reach = math.sqrt(c[k - 1] * c[k - 1] + 2.0 * acc[k - 1] * length[k - 1])
@@ -430,6 +460,13 @@ def plan_trajectory(points, seg_feeds, max_accel: float = None,
     t_cum = 0.0
     for i in range(nseg):
         ve, vx, vc, L, ai = c[i], c[i + 1], cruise[i], length[i], acc[i]
+        if L <= 1e-12 and dwell[i] > 0.0:          # a dwell: held still
+            t_cum += dwell[i]
+            moves.append(Move(length=0.0, cruise_v=vc, entry_v=0.0, exit_v=0.0,
+                              peak_v=0.0, t_acc=0.0, t_cruise=dwell[i],
+                              t_dec=0.0, start=P[i], unit=unit[i], accel=ai))
+            times[i + 1] = t_cum
+            continue
         if L <= 1e-12:                             # null move: passes no time
             moves.append(Move(length=0.0, cruise_v=vc, entry_v=ve, exit_v=vx,
                               peak_v=max(ve, vx), t_acc=0.0, t_cruise=0.0,

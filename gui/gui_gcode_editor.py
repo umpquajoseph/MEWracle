@@ -1089,8 +1089,16 @@ def _line_renumber(src, dst):
     to = np.zeros(len(a) + 2, np.int64)
     for tag, i0, i1, j0, j1 in difflib.SequenceMatcher(
             None, a, b, autojunk=False).get_opcodes():
+        # a changed run pairs its lines in order, but never with a line
+        # that is only a comment: `dst` has the export's own (the layer
+        # markers, the start block's notes) and `src` has none, so pairing
+        # with them put the lead-in move on `;LAYER_COUNT:20`, two lines up,
+        # and clicking the lead-in lit nothing
+        js = [j for j in range(j0, j1) if b[j] and b[j][0] not in ";("] \
+            if tag == "replace" else []
+        js = js or list(range(j0, j1))
         for k in range(i1 - i0):
-            to[i0 + k + 1] = (j0 + k + 1 if k < j1 - j0
+            to[i0 + k + 1] = (js[k] + 1 if k < len(js)
                               else max(j0 + (j1 - j0), 1))
     for i in range(1, len(to)):
         if to[i] == 0:
@@ -4316,22 +4324,39 @@ class _GcodeEditorMixin:
             return polys, dots
         J0 = np.searchsorted(sl, ln, side="left")
         J1 = np.searchsorted(sl, ln, side="right")
-        moving = J1 > J0
+        # a dwell is a segment that goes nowhere (`parse_path`): a line
+        # whose segments all go nowhere does not move, and is a point
+        vv = np.asarray(v, np.float64)
+        went = np.r_[0, np.cumsum(
+            np.linalg.norm(np.diff(vv, axis=0), axis=1) > 1e-12)] \
+            if len(vv) > 1 else np.zeros(1, np.int64)
+        moving = (J1 > J0) & (went[np.minimum(J1, len(went) - 1)]
+                              > went[np.minimum(J0, len(went) - 1)])
 
         def fiber(j0, j1):
+            # cut at the move's own start and end, between the fiber's
+            # points: a coarse fiber (a lead-in is two points) cut at "the
+            # point at or before" lit the whole lead-in with the next move
+            ta, tb = float(t[j0]), float(t[j1])
+            if win is not None:
+                ta, tb = max(ta, win[0]), min(tb, win[1])
             out = []
             for Tf, Pf in fibers:
-                if Tf[0] > t[j1]:
+                if Tf[0] > tb:
                     break
-                i0 = max(int(np.searchsorted(Tf, t[j0], "right")) - 1, 0)
-                i1 = min(int(np.searchsorted(Tf, t[j1], "left")), len(Tf) - 1)
-                if win is not None:
-                    i0 = max(i0, int(np.searchsorted(Tf, win[0], "right")) - 1,
-                             0)
-                    i1 = min(i1, int(np.searchsorted(Tf, win[1], "left")),
-                             len(Tf) - 1)
-                if i1 > i0:
-                    out.append(Pf[i0:i1 + 1])
+                i0 = max(int(np.searchsorted(Tf, ta, "right")) - 1, 0)
+                i1 = min(int(np.searchsorted(Tf, tb, "left")), len(Tf) - 1)
+                if i1 <= i0:
+                    continue
+                src = np.asarray(Pf, np.float64)
+                seg = np.array(src[i0:i1 + 1])
+                if Tf[i0] < ta < Tf[i0 + 1]:
+                    f = (ta - Tf[i0]) / (Tf[i0 + 1] - Tf[i0])
+                    seg[0] = src[i0] + f * (src[i0 + 1] - src[i0])
+                if Tf[i1 - 1] < tb < Tf[i1]:
+                    f = (tb - Tf[i1 - 1]) / (Tf[i1] - Tf[i1 - 1])
+                    seg[-1] = src[i1 - 1] + f * (src[i1] - src[i1 - 1])
+                out.append(seg)
             return out
 
         # runs of consecutive selected lines; each run's moves light as one
@@ -4367,7 +4392,14 @@ class _GcodeEditorMixin:
                                             or t[int(J0[q])] > win[1]):
                         continue
                     polys.append(v[int(J0[q]):int(J1[q]) + 1])
+        # a line that does not move is lit as a point only when its run of
+        # selected lines has no move: a layer's `;LAYER:n` marker, selected
+        # with the layer, sits at the previous layer's end, and its point
+        # there was not the layer's (a Move left it behind)
+        moved_runs = set(run[mv].tolist()) if len(mv) else set()
         for q in np.flatnonzero(~moving):
+            if run[q] in moved_runs:
+                continue
             j0 = int(J0[q])
             tt = t[j0] if j0 < len(sl) else t[-1]
             if win is not None and not win[0] <= tt <= win[1]:

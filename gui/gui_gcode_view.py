@@ -44,6 +44,7 @@ typing; the arrow keys and Home only when the picture (or the slider) has the
 focus, since the tree and the text use them. Clicking the picture gives it the
 focus."""
 
+import json
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk
@@ -500,6 +501,27 @@ class _GcodeViewMixin:
                                     "is no speed to color by.")
         else:
             self._view_why_speed = None
+
+    def _fiber_params_scaffold(self):
+        """On the page, every part of the print goes to the simulation in the
+        colour the page's picture draws it in (`_view_scaffold_colors`, by the
+        part's place in print order: the stabilization base is the first). The
+        designer's own rule (`gui_args`) gives the base scaffold 1's colour,
+        so the picture and the simulation disagreed on any print with a base."""
+        args = list(super()._fiber_params_scaffold())
+        if not getattr(self, "_gce_in_page_scope", False) \
+                or "--scaffold-groups" not in args:
+            return args
+        k = args.index("--scaffold-groups") + 1
+        try:
+            groups = json.loads(args[k])
+            cols = self._view_scaffold_colors(len(groups), None)
+            for g, rgb in zip(groups, cols):
+                g["color"] = self._view_hex(rgb)
+        except (ValueError, TypeError, AttributeError, IndexError):
+            return args
+        args[k] = json.dumps(groups)
+        return args
 
     def _view_scaffold_colors(self, n, fallback):
         out = []

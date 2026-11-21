@@ -117,12 +117,14 @@ from vtk.util import numpy_support
 
 from gcode_to_fibers import (DEFAULT_FEED, DEPO_CACHE_EXT, apply_sag,
                              arc_xy_points, build_deposition_mesh,
+                             dwell_seconds_of,
                              decimate_keep,
                              file_skips_self_crossings, load_depo_cache,
                              decimate_idx_for, load_depo_decimation,
                              write_depo_decimation,
                              load_depo_diam_by_time, load_depo_pdia, parse_gcode,
                              path_colors_from_groups, path_diameters_from_groups,
+                             dwell_continued,
                              rotary_split_seconds, _hex_to_rgb255,
                              set_fiber_transform, set_sag_law, set_fusion_law,
                              _DEFAULT_SAG_RESET_LAYERS,
@@ -790,6 +792,22 @@ def parse_path(path, frame=None, five=None):
             if split_rot and code in ("G75", "G76"):
                 split = True
                 per = 60.0 if code == "G76" else 1.0
+                continue
+            if code in ("G4", "G04"):
+                # a dwell: a segment that goes nowhere and lasts the dwell,
+                # so the head holds still and the clock runs on. It keeps
+                # the kind of the move before it (the jet keeps flowing)
+                secs = dwell_seconds_of(tokens[1:])
+                if secs > 0.0:
+                    t_cum += secs
+                    verts.append(list(verts[-1]))
+                    mach.append(list(mach[-1]))
+                    rots.append(list(rots[-1]) if five is not None
+                                else rots[-1])
+                    times.append(t_cum)
+                    is_dep.append(bool(is_dep[-1]) if is_dep else False)
+                    seg_feeds.append(seg_feeds[-1] if seg_feeds else feed)
+                    seg_line.append(lineno)
                 continue
             if code not in ("G0", "G1", "G00", "G01"):
                 continue
@@ -2996,9 +3014,16 @@ class Player:
         self._traj = None                         # the planned trajectory (HUD speed_at)
         if plan_trajectory is None or self.max_accel <= 0.0 or len(verts) < 2:
             return verts, times_naive, is_dep, seg_feeds, seg_line
+        # a G4 is a segment that goes nowhere and lasts the dwell
+        # (`parse_path`): the plan holds the head still that long
+        tn = np.asarray(times_naive, dtype=np.float64)
+        still = np.linalg.norm(np.diff(np.asarray(verts, np.float64), axis=0),
+                               axis=1) <= 1e-12
+        seg_dwell = np.where(still, np.diff(tn), 0.0)
         traj = plan_trajectory(verts, seg_feeds, max_accel=self.max_accel,
                                square_corner_velocity=self.scv,
-                               seg_accel=self._rotary_seg_accel(verts))
+                               seg_accel=self._rotary_seg_accel(verts),
+                               seg_dwell=seg_dwell if seg_dwell.any() else None)
         if not traj.moves:
             return verts, times_naive, is_dep, seg_feeds, seg_line
         rt, rp, _rspeed, _rarc, rseg = traj.resample()
@@ -3152,8 +3177,9 @@ class Player:
                 if lookup is not None:
                     diam = np.interp(ttimes, lookup[0], lookup[1])
                 else:
-                    path_diam = path_diameters_from_groups(groups, len(paths),
-                                                           diameter)
+                    path_diam = path_diameters_from_groups(
+                        groups, len(paths), diameter,
+                        self._dwell_continued(len(paths)))
                     diam = np.concatenate([
                         np.full(len(p),
                                 diameter if path_diam is None
@@ -3324,7 +3350,8 @@ class Player:
         self_crossings = not file_skips_self_crossings(self.gcode_path)
         # one diameter per commanded fibre (per-scaffold groups), so each scaffold
         # marches at its own thickness -- the same seam the static export uses.
-        base_pd = path_diameters_from_groups(groups, len(self._cmd_paths), diameter)
+        base_pd = path_diameters_from_groups(groups, len(self._cmd_paths), diameter,
+                                             dwell_continued(self._cmd_paths))
         # LOCKED-cache seed: the SAME `.depo` the locked sim rides. While UNEDITED the
         # march commits these cached fibres verbatim instead of re-deriving via
         # mew_live -- so the live sim is byte-for-byte the locked sim (mew_live and
@@ -3561,7 +3588,8 @@ class Player:
         diameter = float(opts.get("diameter", 0.02))
         try:
             colors = path_colors_from_groups(groups, len(self._cmd_paths),
-                                             self._fiber_rgb255())
+                                             self._fiber_rgb255(),
+                                             dwell_continued(self._cmd_paths))
             path_color = [colors[i] for i in idx] if colors is not None else None
             # reuse the cached tube block for any fibre whose sagged geometry +
             # per-point diameter are unchanged (every committed fibre; the tip only
@@ -6097,6 +6125,30 @@ class Player:
                 m.ScalarVisibilityOff()
                 a.GetProperty().SetColor(*self._solid_rgb())
 
+    def _dwell_continued(self, n_paths):
+        """The fibres a `G4` split off the one before (`dwell_continued`), on
+        the COMMANDED paths of this file, for a caller holding `n_paths`
+        cached (sagged) fibres: the cache keeps one fibre per commanded fibre,
+        and its moved vertices cannot say where a dwell split one. Parsed once
+        per file; an empty set when the counts differ or the file cannot be
+        read, which leaves the one-fibre-per-layer mapping as it was."""
+        key = (self.gcode_path, n_paths)
+        hit = getattr(self, "_dwell_cont_cache", None)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        out = set()
+        try:
+            cmd = parse_gcode(self.gcode_path,
+                              mode=self.fiber_opts.get("mode", "auto"),
+                              arc_segments=self.fiber_opts.get("arc_segments"),
+                              frame=getattr(self, "_frame", None))
+            if len(cmd) == n_paths:
+                out = dwell_continued(cmd)
+        except Exception:  # noqa: BLE001 -- no split known: as before
+            out = set()
+        self._dwell_cont_cache = (key, out)
+        return out
+
     def _fiber_rgb255(self):
         """The deposited fibre's base colour as a 0..255 RGB triple.
 
@@ -6336,7 +6388,8 @@ class Player:
                 # viewer colours each scaffold like the exact mesh and the STL
                 # viewer, instead of one solid grey. None -> stays solid, as before.
                 path_color = path_colors_from_groups(
-                    groups, len(paths), self._fiber_rgb255())
+                    groups, len(paths), self._fiber_rgb255(),
+                    self._dwell_continued(len(paths)))
                 dec = None
                 if render.startswith("tube:") and sides >= 3:
                     # the quality chosen is a wish, not a promise: a mesh that
