@@ -3,6 +3,6 @@
   "machine_default": "MEWron 0.2",
   "sweep_default": null,
   "calibration_default": "MEWron 0.2 22G",
-  "machine_default_4axis": null,
+  "machine_default_4axis": "MEWron 0.2 (4-axis)",
   "default_4axis": "Mandrel default"
 }

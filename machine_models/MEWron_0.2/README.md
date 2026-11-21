@@ -1,2 +1,2 @@
-The MEWron 0.2's printhead, gantry, collection bed and frame, which the "MEWron 0.2" printer preset draws in Setup and Simulation.
+The MEWron 0.2's printhead, gantry, collection bed and frame, which the "MEWron 0.2" printer preset draws in Setup and Simulation. The "MEWron 0.2 (4-axis)" preset draws the mandrel holder in place of the collection bed, and loads when you pick Mandrel (4-axis).
 From source they are found here with no extra step. The downloaded app carries the printhead itself; for the rest, put the whole `machine_models` folder next to `MEWracle.exe`.
