@@ -362,8 +362,14 @@ class _FiberTargetMixin:
         try:
             gap = float(self.sim_standoff.get())
             volt = float(self.sim_voltage.get())
-            p = float(self.sim_pressure.get()) * PSI_TO_PA
             t = float(self.sim_temperature.get())
+            try:
+                p = float(self.sim_pressure.get()) * PSI_TO_PA
+            except ValueError:
+                # a filament print hides the pressure: it does not enter
+                if self._feed_mode() == "pressure":
+                    raise
+                p = 0.0
         except (ValueError, tk.TclError, AttributeError):
             return None, ("Fill in the Physics page's Process parameters "
                           "(gap, voltage, pressure, temperature).")
@@ -624,6 +630,8 @@ class _FiberTargetMixin:
         if d is None:
             R.why = "Type the fiber diameter you want."
             return R
+        if self._feed_mode() != "pressure":
+            return self._ft_solve_feed(R, tm, now, d)
         lag = R.lag = self._ft_target_lag()
         if lag is not None and not math.isfinite(lag):
             R.why = "Type the jet lag in mm, or leave it blank."
@@ -691,6 +699,69 @@ class _FiberTargetMixin:
                 and (lag is None or abs(R.now_jet.lag_distance - lag)
                      <= _ALREADY * lag):
             R.already = True
+        return R
+
+    def _ft_solve_feed(self, R, tm, now, d):
+        """A filament-fed print (Physics › Process parameters): the diameter
+        is mass conservation, so there is no chart. A speed-command feeder
+        gives d at a speed through one number, the Feeder rate:
+        (pi/4) d^2 v = filament area x feed; temperature and the needle do
+        not enter. Per line (E) gives d at ANY speed: (d / d_fil)^2 mm of
+        filament per mm of fiber, which Save writes from the scaffold's
+        diameter. The answer is said in the result row, and Apply writes
+        it (`R.feed_apply`)."""
+        mode = self._feed_mode()
+        holds, _bad = self._ft_holds()
+        v = (holds.get("speed") if holds.get("speed") is not None
+             else now.speed)
+        R.tm = None                         # no pressure chart to draw
+        model = tm.model()
+        st = self._ft_vars()
+        try:
+            if mode == "speed":
+                n = model.feed_setting_for(0.25 * math.pi * d * d * v)
+            else:
+                ratio = model.e_per_mm_for(d)
+        except ValueError as exc:
+            R.why = "Setup › Material delivery: %s." % exc
+            return R
+        d_txt = "%s %s" % (_g(self._ft_d_show(d)), gui_units.unit("fiber_d"))
+        idx = self._ft_scope_indices()
+        sv = self._ft_page_scaffolds()
+
+        def done(undo, said):
+            st["undo"] = undo
+            try:
+                self.status.set("Fiber target: set %s." % said)
+            except AttributeError:
+                pass
+            st["rev"].set(st["rev"].get() + 1)
+        if mode == "speed":
+            R.why = ("Feeder rate %s gives %s at %s %s. The melt temperature "
+                     "and the needle do not change it: the feeder sets the "
+                     "flow." % (_g(n, 4), d_txt, _g(self._ft_v_show(v)),
+                                gui_units.unit("speed")))
+            var = self.cal_vars.get("cal.feed_setting")
+            if var is None or not n > 0.0:
+                return R
+
+            def apply_speed():
+                undo = [(var, var.get())]
+                var.set("%.5g" % n)
+                done(undo, "the Feeder rate to %s" % _g(n, 4))
+            R.feed_apply = apply_speed
+            return R
+        R.why = ("%s mm of filament per mm of fiber gives %s at any speed. "
+                 "Save writes it as E from the scaffold's fiber diameter."
+                 % (_g(ratio, 4), d_txt))
+
+        def apply_e():
+            undo = []
+            for i in idx:
+                undo.append((sv[i]["diameter"], sv[i]["diameter"].get()))
+                sv[i]["diameter"].set("%.4g" % d)
+            done(undo, "fiber diameter %s" % d_txt)
+        R.feed_apply = apply_e if idx else None
         return R
 
     # ------------------------------------------------------------------ #
@@ -1110,7 +1181,11 @@ class FiberTargetPanel(ttk.Frame):
 
     def _do_apply(self):
         if self._R is not None:
-            self.app._ft_apply(self._R)
+            fn = getattr(self._R, "feed_apply", None)
+            if fn is not None:
+                fn()
+            else:
+                self.app._ft_apply(self._R)
 
     def pick(self, speed, temperature):
         """A click on a line: hold that point's speed (mm/s) and temperature
@@ -1189,7 +1264,8 @@ class FiberTargetPanel(ttk.Frame):
         self.chart.fit(self._full_h, self._min_h,
                        below=self._bot.winfo_reqheight() + gui_fonts.SP["l"])
         self.chart.draw(R)
-        ok = R.chosen is not None and R.chosen.ok and not R.already
+        ok = ((R.chosen is not None and R.chosen.ok and not R.already)
+              or getattr(R, "feed_apply", None) is not None)
         self._apply.state(["!disabled"] if ok else ["disabled"])
         self._back.state(["!disabled"] if st["undo"] else ["disabled"])
 

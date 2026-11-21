@@ -39,7 +39,6 @@ the emitted g-code + CSV match what the operator printed before.
 """
 import inspect
 import gui_prefs
-import gui_units
 import json
 import math
 import os
@@ -310,6 +309,18 @@ class _SweepsMixin:
         S("visc_line_len", "");   S("visc_pitch", "1.5")
         S("visc_col_gap", "5.0"); S("visc_base_speed", "")
         B("visc_bottom_up", False)
+        # the FEEDER plate -- a filament printer's Fiber diameter calibration:
+        # ONE temperature and ONE speed, lines at one Feeder rate, and an
+        # optional second slide at twice the rate that shows whether the
+        # feeder gear slips (off by default: one plate unless asked). Its own
+        # keys, like every other protocol's. A speed or temperature sweep is
+        # no use here: the diameter is mass conservation, which neither enters.
+        S("feed_temp", "100")
+        S("feed_speed", "700");   S("feed_rate", "1000")
+        B("feed_slip", False);    S("feed_reps", "5")
+        S("feed_line_len", "");   S("feed_pitch", "1.5")
+        S("feed_col_gap", "5.0"); S("feed_base_speed", "")
+        B("feed_bottom_up", False)
         # the SAG LADDER -- a row of walls whose spacing steps wider along X,
         # crossed by two bridging fibres that droop into every gap at once.
         # Its own keys, like every other protocol's: the ladder is the only
@@ -478,7 +489,7 @@ class _SweepsMixin:
     _SW_PROTOCOL_PREFIXES = {
         "cts": ("cts_",), "cts4": ("cts4_",), "visc": ("visc_",),
         "diam": ("diam_",), "circle": ("circ_",), "sag": ("sag_",),
-        "tube": ("tube_",),
+        "tube": ("tube_",), "feed": ("feed_",),
     }
     #: shared print section (a `calibration_procedures.SHARED_CARDS` id) -> the
     #: sw.* keys it edits. A tab's preset takes the sections that tab SHOWS,
@@ -546,6 +557,8 @@ class _SweepsMixin:
         "sw.diam_reps": "Lines per temp",
         "sw.visc_temp": "Viscosity temp", "sw.visc_speed": "Viscosity feed",
         "sw.visc_reps": "Viscosity lines",
+        "sw.feed_rate": "Feeder plate rate", "sw.feed_speed": "Feeder plate feed",
+        "sw.feed_reps": "Feeder plate lines", "sw.feed_slip": "Slip check",
         "sw.sag_spans": "Sag spans", "sw.sag_lane": "Sag travel lane",
         "sw.sag_layers": "Sag wall layers",
         "sw.tube_angles": "Tube angles", "sw.tube_spacing": "Tube spacing",
@@ -705,6 +718,8 @@ class _SweepsMixin:
             self._sw_build_protocol_diam(parent, key)
         elif protocol == "visc":
             self._sw_build_protocol_visc(parent, key)
+        elif protocol == "feed":
+            self._sw_build_protocol_feed(parent, key)
         elif protocol == "sag":
             self._sw_build_protocol_sag(parent, key)
         elif protocol == "tube":
@@ -733,11 +748,6 @@ class _SweepsMixin:
                  "each line to one side, so the gaps between them alternate "
                  "wide and narrow. The 0° and 90° bands are checks: there the "
                  "gaps should come out equal.")
-        # a live verdict, one var per MOUNT, as the sag card keeps its own
-        note = tk.StringVar(value="")
-        self._sw_tube_notes = getattr(self, "_sw_tube_notes", [])
-        self._sw_tube_notes.append(note)
-        F.live(None, textvariable=note, wrap=430)
         self._sw_grid_rows(F, [
             ("Winding angles", "tube_angles", "°",
              "One band per angle, printed in this order from the near end. "
@@ -764,43 +774,6 @@ class _SweepsMixin:
              "Turns of the mandrel printed before the first band, so the jet "
              "is steady when the first band starts."),
         ] + self._sw_rod_rows(shrinks=False))
-        self._sw_rod_note_line(F, "tube")
-        mcts = tk.StringVar(value="")
-        self._sw_tube_cts_notes = getattr(self, "_sw_tube_cts_notes", [])
-        self._sw_tube_cts_notes.append(mcts)
-        F.live(None, textvariable=mcts, wrap=430)
-        self._sw_update_tube_cts()
-
-    def _sw_tube_cts_text(self):
-        """The read-only mandrel CTS line: the value the CTS (4-axis) tab's
-        Apply wrote to `m_cts` (mm/s, its one home), shown in mm/min like every
-        speed on this page -- or, blank, the flat CTS the model falls back on."""
-        text = getattr(self, "m_cts", None)
-        text = text.get().strip() if text is not None else ""
-        try:
-            v = float(text) if text else None
-        except ValueError:
-            v = None
-        if v is not None and v > 0.0:
-            return ("Mandrel CTS: %.0f mm/min, measured with “CTS (mandrel)”."
-                    % (v * 60.0))
-        try:
-            flat = "%.0f mm/min" % (float(self._sw_resolve_cts()) * 60.0)
-        except Exception:  # noqa: BLE001 -- a readout, never a blocker
-            flat = "the flat CTS"
-        return ("Mandrel CTS: not measured yet, so the flat CTS (%s) is used. "
-                "Measure it with the “CTS (mandrel)” type. Its Apply fills this in."
-                % flat)
-
-    def _sw_update_tube_cts(self):
-        for var in getattr(self, "_sw_tube_cts_notes", []):
-            var.set(self._sw_tube_cts_text())
-        # the line follows the value it reads, wherever it is written from
-        if not getattr(self, "_sw_tube_cts_traced", False):
-            src = getattr(self, "m_cts", None)
-            if src is not None:
-                src.trace_add("write", lambda *_a: self._sw_update_tube_cts())
-                self._sw_tube_cts_traced = True
 
     def _sw_build_protocol_sag(self, parent, key=None):
         """The sag ladder's knobs: the span list, the walls that make the gaps and
@@ -819,13 +792,6 @@ class _SweepsMixin:
                  "not the open gap. The open gap is one fiber narrower. Two "
                  "fibers are laid across the whole row and sag into every "
                  "gap at once, so one print gives sag against span.")
-        # One var per MOUNT, never one attribute -- see `_sw_build_protocol_diam`.
-        # A live verdict (which spans the droop law says are measurable), so it
-        # stays on screen rather than folding into a tooltip.
-        note = tk.StringVar(value="")
-        self._sw_sag_notes = getattr(self, "_sw_sag_notes", [])
-        self._sw_sag_notes.append(note)
-        F.live(None, textvariable=note, wrap=430)
         # The feed is mm/MIN here and the fit reads mm/S, the same crossing the
         # CTS card carries, so the unit is in the label on both sides.
         self._sw_grid_rows(F, [
@@ -877,11 +843,6 @@ class _SweepsMixin:
                  "becomes ONE slide of identical lines. The temperature is not "
                  "in the g-code. You set it on the printer before the print, so "
                  "the fit is told it separately.")
-        # One var per MOUNT, never one attribute: see `_sw_build_protocol_diam`.
-        note = tk.StringVar(value="")
-        self._sw_visc_notes = getattr(self, "_sw_visc_notes", [])
-        self._sw_visc_notes.append(note)
-        F.live(None, textvariable=note, wrap=430)
         self._sw_grid_rows(F, [
             # "Print temperature", not "Temperature": the fit box lower down the
             # SAME card is labelled "Temperature (°C)", and one card carrying two
@@ -906,6 +867,66 @@ class _SweepsMixin:
              "Lay the lines upwards instead of downwards."),
         ])
 
+    def _sw_build_protocol_feed(self, parent, key=None):
+        """The feeder plate's knobs (Fiber diameter (filament)): the viscosity
+        plate's, with a Feeder rate in place of the pressure and a slip check.
+
+        One temperature and one speed, because neither enters a filament
+        print's diameter. The rate is the flavor's feed-command value.
+
+        No live text above the fields: a note rewritten on every keystroke
+        re-wraps and moves the fields being typed in."""
+        F = gui_form.Form(parent)
+        self._cal_form_section(
+            F, key, "feed_conditions", "Print conditions",
+            info="The feeder rate, speed and temperature the lines are printed "
+                 "at. Each slide is its own file, and its start block sets "
+                 "that slide's feeder rate.")
+        self._sw_grid_rows(F, [
+            ("Feeder rate", "feed_rate", "",
+             "The number the feeder command is sent (OCTO1's on a MEWron). "
+             "Set it to the rate you print scaffolds at."),
+            ("Slip check at twice the rate", "feed_slip", "",
+             "Add a second slide at twice the Feeder rate. If its fibers are "
+             "thinner than twice the flow predicts, the feeder gear is "
+             "slipping at the higher rate."),
+            ("Print temperature", "feed_temp", "°C",
+             "The one temperature the plate is printed at. It does not change "
+             "the diameter of a filament print; it only has to melt the "
+             "filament."),
+            ("Print feed", "feed_speed", "mm/min",
+             "The one speed the lines are printed at. Keep it above the CTS so "
+             "the lines lay straight."),
+            ("Lines on each slide", "feed_reps", "",
+             "Replicate fibers to measure."),
+            ("Line length", "feed_line_len", "mm",
+             "How long each line runs. Blank fills the slide to its far edge; "
+             "20 mm is the minimum."),
+            ("Line pitch", "feed_pitch", "mm",
+             "The spacing between neighboring lines."),
+            ("Stabilization scaffold → lines gap", "feed_col_gap", "mm",
+             "The distance from the stabilization scaffold to the first line."),
+            ("Stabilization scaffold feed", "feed_base_speed", "mm/min",
+             "The feed the stabilization scaffold is printed at. Blank uses the "
+             "print feed. The flow settles on it after the rate changes."),
+            ("First line at bottom", "feed_bottom_up", "",
+             "Lay the lines upwards instead of downwards."),
+        ])
+
+    def _sw_feed_rate(self):
+        """The feeder plate's slide-1 rate. Raises a NAMED ValueError."""
+        text = self.sw_vars["feed_rate"].get().strip()
+        where = "Feeder rate"
+        try:
+            rate = float(text)
+        except ValueError:
+            raise ValueError(f"{where} needs a number"
+                             + (" (it's blank)" if not text
+                                else f", not “{text}”")) from None
+        if not rate > 0:
+            raise ValueError(f"{where} must be above 0")
+        return rate
+
     def _sw_build_protocol_diam(self, parent, key=None):
         """The temperature ladder's knobs. One rung per slide; the operator sets the
         nozzle between prints, so no temperature word is emitted."""
@@ -916,17 +937,6 @@ class _SweepsMixin:
                  "becomes its OWN slide of identical lines. The temperature is "
                  "not in the g-code. You set it on the printer between prints. "
                  "Print slide 1 first: it runs on the freshest melt.")
-        # A LIST, not an attribute holding one var. This protocol is mounted on
-        # TWO cards, so the second build used to overwrite the attribute and leave
-        # the first card's label bound to a variable nothing wrote to any more --
-        # the Viscosity card rendered the line BLANK while the Activation Ea card
-        # rendered it correctly, which is the same class of bug the page's
-        # `_init_calibration_vars` docstring records. Every mounted label gets its
-        # own var and `_sw_update_diam_readout` writes all of them.
-        note = tk.StringVar(value="")
-        self._sw_diam_notes = getattr(self, "_sw_diam_notes", [])
-        self._sw_diam_notes.append(note)
-        F.live(None, textvariable=note, wrap=430)
         # The feed is mm/MIN here and the fits read mm/S, the same crossing the CTS
         # card carries, so the unit is in the label on both sides.
         self._sw_grid_rows(F, [
@@ -1055,41 +1065,6 @@ class _SweepsMixin:
              "Bare mandrel between one speed's lines and the next, so you "
              "can tell the speeds apart."),
         ] + self._sw_rod_rows())
-        var = tk.StringVar(value="")
-        self._sw_cts4_on_var = var
-        F.live(None, textvariable=var, wrap=430)
-        for name in ("m_diameter", "sim_standoff"):
-            src = getattr(self, name, None)
-            if src is not None:
-                src.trace_add("write", lambda *_a: self._sw_cts4_on_refresh())
-        self._sw_cts4_on_refresh()
-        self._sw_rod_note_line(F, "cts4")
-
-    def _sw_cts4_on_refresh(self):
-        """"Printed on the 3 mm mandrel ..., at 4.5 mm printhead elevation" --
-        what the mandrel ladder reads from the pages that own those values."""
-        var = getattr(self, "_sw_cts4_on_var", None)
-        if var is None:
-            return
-        gap = getattr(self, "sim_standoff", None)
-        gap = gap.get().strip() if gap is not None else ""
-        var.set("Printed on the %g mm mandrel set on the Scaffold designer, "
-                "at the “Nozzle–collector gap” on the Physics page (%s mm)."
-                % (self._sw_mandrel_diameter(), gap or "?"))
-
-    def _sw_rod_note_line(self, F, kind):
-        """The plain line under a mandrel print's rod rows: what the rod did to
-        the print (shrunk it to fit, left a band too short to settle).
-
-        It sits in the tab's own settings card, beside the rows that cause it,
-        and NOT in the page's red warning strip: on a fixed rod a shrink is the
-        expected outcome, and the strip's red, dot-joined wall read as an error
-        nobody could parse. One var per mount and per kind, so the tube's note
-        never lands on the CTS card (`_sw_render_warnings`)."""
-        var = tk.StringVar(value="")
-        self._sw_rod_notes = getattr(self, "_sw_rod_notes", {})
-        self._sw_rod_notes.setdefault(kind, []).append(var)
-        F.live(None, textvariable=var, wrap=430)
 
     #: `rod_place` keys, as the Scaffold designer words its own choice
     #: (`gui_mandrel.PLACEMENTS`, the one table)
@@ -1125,8 +1100,6 @@ class _SweepsMixin:
             info="What the plate about to be laid is conditional on: the gap, "
                  "the believed CTS and the fiber diameter, each read live from "
                  "the page that owns it.")
-        self._sw_circ_cts_var = tk.StringVar(value="")
-        F.live(None, textvariable=self._sw_circ_cts_var, wrap=430)
 
         # -- the specimen table --------------------------------------------- #
         # One row per circle the plate will carry, with the radius the sizing rule lands
@@ -1960,7 +1933,29 @@ class _SweepsMixin:
                 # one rung: its own setpoint; several in one file: a list,
                 # which writes no temperature command (not a number)
                 ctx["temperature"] = ", ".join("%g" % float(t) for t in temps)
+            # the feeder plate: each slide's own feeder rate, the same way
+            # (a list writes no feed command), in any delivery: the plate
+            # exists to run the feeder at that rate
+            rates = []
+            for row in res.rows:
+                r = row.get("feed_setting")
+                if r in ("", None) or (wanted is not None
+                                       and row.get("print") != wanted):
+                    continue
+                if r not in rates:
+                    rates.append(r)
+            if rates:
+                ctx["feed"] = ", ".join("%g" % float(r) for r in rates)
         return ctx
+
+    def _sw_extrude_options(self):
+        """Per line (E) for a calibration print: the first scaffold's
+        ratio on every move (`_extrude_options`), None in any other feed."""
+        ex = self._extrude_options()
+        if not ex:
+            return None
+        return {"ratios": ex["ratios"][:1], "radius": ex["radius"],
+                "starts": []}
 
     def _sw_export_flavor(self):
         """The Machine page's flavor, as the designer's export uses it."""
@@ -1999,7 +1994,10 @@ class _SweepsMixin:
             incremental=inc, origin=origin, rotary_axes=rot,
             start_block=start, end_block=end,
             context=context,
-            rig_recipes=recipes() if recipes is not None else [])
+            rig_recipes=recipes() if recipes is not None else [],
+            # a calibration print is fed at the first scaffold's diameter:
+            # in this feed the diameter is set by E, not by its speeds
+            extrude=self._sw_extrude_options())
 
     def _sw_user_gcode(self, text, index=None, filename=None):
         """One slide's g-code as the user gets it: the engine's bytes through
@@ -2138,12 +2136,9 @@ class _SweepsMixin:
         if pvar is not None:
             # the live values only; where each comes from is the row's tooltip
             pvar.set(f"Plate {w:g} x {h:g} mm, lower-left at ({ox:g}, {oy:g})")
-        cts = self._sw_resolve_cts()
-        gap = self._sw_gap()
-        phys = "ON" if self._sw_physics_on() else "off"
-        self._sw_update_circle_readout(cts, gap, phys)
-        self._sw_update_diam_readout(cts)
-        self._sw_update_sag_readout()
+        # the specimen table's radii are functions of the gap and the sizing
+        # dials, so it refreshes on this beat
+        self._sw_circ_refresh_table()
         # the ladder design decides how many measurement rows the Activation Ea
         # card shows and what the Viscosity card's conditions are seeded with, so
         # the two fit forms refresh on the same beat the readouts do. Guarded: the
@@ -2156,45 +2151,6 @@ class _SweepsMixin:
         sync_sag = getattr(self, "_cal_sync_sag_fit", None)
         if sync_sag is not None:
             sync_sag()
-
-    def _sw_update_diam_readout(self, cts):
-        """The conditions line on BOTH diameter cards: the pressure the fit will
-        be told (the Physics page's, not a field here), and whether the chosen
-        feed clears the CTS. The runbook picks the fixed speed as roughly twice
-        the CTS at the HOTTEST rung, since CTS rises with temperature and a speed
-        safe there is safe everywhere cooler.
-
-        Two note lists, because the ladder and the viscosity plate are separate
-        designs with separate feeds: writing one text into both would show the Ea
-        tab's feed on the Viscosity card."""
-        try:
-            press = _finite(getattr(self, "sim_pressure",
-                                    tk.StringVar(value="3")).get())
-        except (tk.TclError, ValueError):
-            press = 3.0
-        for attr, feed_key, tail in (
-                ("_sw_diam_notes", "diam_speed",
-                 "and it must not move between rungs"),
-                ("_sw_visc_notes", "visc_speed",
-                 "and it is what the fit is told")):
-            notes = getattr(self, attr, None)
-            if not notes:
-                continue
-            try:
-                feed = _finite(self.sw_vars[feed_key].get())
-            except (tk.TclError, ValueError, KeyError):
-                feed = 0.0
-            ratio = (feed / 60.0 / cts) if cts > 0 else 0.0
-            verdict = ("below the CTS, so the fiber will coil, not lay straight"
-                       if ratio < 1.0 else
-                       "under 2× CTS; the runbook suggests ≈2×" if ratio < 2.0
-                       else "clears the runbook's ≈2× CTS")
-            text = ("Printed at %g psi, from the Physics page. The pressure is "
-                    "not a field here, %s. %.0f mm/min is %.1f× the believed CTS "
-                    "(%.2f mm/s at the current gap): %s."
-                    % (press, tail, feed, ratio, cts, verdict))
-            for var in notes:
-                var.set(text)
 
     def _sw_sag_law(self):
         """(c, p) from the live rig calibration -- the droop law's magnitude and span
@@ -2211,67 +2167,6 @@ class _SweepsMixin:
             return float(cal.sag_coeff), float(cal.sag_span_exp)
         except Exception:  # noqa: BLE001 -- physics/calibration absent or bad field
             return dflt.sag_coeff, dflt.sag_span_exp
-
-    def _sw_update_sag_readout(self):
-        """The conditions line on the Sag card: the row's footprint, the wall height
-        in mm, and WHICH SPANS the droop law says can actually be measured.
-
-        The wall height is the one number this design turns on and it is NOT a
-        length the operator types -- it is a layer count times the fiber diameter
-        the Scaffold designer owns, so the card has to do that multiplication on
-        screen. What it is compared against is `c*span^p`, not the span: the two are
-        both millimetres, which is how the first version of this line came to
-        compare the wall height to the widest span directly and call a 2 mm span
-        clear at 0.285 mm of wall when its predicted droop is 1.37 mm.
-        """
-        notes = getattr(self, "_sw_sag_notes", None)
-        if not notes:
-            return
-        v = self.sw_vars
-
-        def _f(key, dflt=0.0):
-            try:
-                return _finite(v[key].get())
-            except (tk.TclError, ValueError, KeyError):
-                return dflt
-
-        gaps = mew_sweeps.sag_gaps(v["sag_spans"].get(),
-                                   bool(v["sag_mirror"].get()))
-        if not gaps:
-            text = "Type at least one span in mm."
-        else:
-            diam = self._sw_diam_mm()
-            layers = int(_f("sag_layers", 0))
-            height = max(0, layers - 1) * diam
-            width = sum(gaps) + 2 * _f("sag_lead")
-            mid_lane = v["sag_lane"].get().strip() != "edge"
-            depth_y = _f("sag_wall_len") * (2.0 if mid_lane else 1.0)
-            coeff, exp = self._sw_sag_law()
-            flat, thin, good = mew_sweeps.sag_band(
-                sorted(set(gaps)), coeff, exp, diam, height)
-            if not good:
-                verdict = ("the sag law says NO span here is measurable, so "
-                           "raise the wall height")
-            elif flat or thin:
-                verdict = ("only %s mm are measurable; %s"
-                           % (" / ".join("%g" % s for s in good),
-                              " and ".join(x for x in (
-                                  ("%s flatten on the collector"
-                                   % " / ".join("%g" % s for s in flat))
-                                  if flat else "",
-                                  ("%s sag less than three fiber diameters"
-                                   % " / ".join("%g" % s for s in thin))
-                                  if thin else "") if x)))
-            else:
-                verdict = "every span sags into the measurable band"
-            text = ("%d span(s) over %d walls: %.1f × %g mm of plate, travel "
-                    "lane %s. The walls are %d layers of %.0f µm fiber, so they "
-                    "stand %.3f mm tall: %s."
-                    % (len(gaps), len(gaps) + 1, width, depth_y,
-                       "down the wall middle" if mid_lane else "at one end",
-                       layers, diam * 1000, height, verdict))
-        for var in notes:
-            var.set(text)
 
     # ------------------------------------------------------------------ #
     # the circle SPECIMEN TABLE (one row per speed ratio)
@@ -2448,47 +2343,6 @@ class _SweepsMixin:
         finally:
             self._sw_circ_busy = False
 
-    def _sw_update_circle_readout(self, cts, gap, phys):
-        """The lag-circle card's Conditions line. It carries two things nothing
-        else on the page shows, because both are decided HERE and neither is
-        visible from the numbers on the form: the radii the sizing rule lands
-        on at this gap (they scale with it), and the fact that the k this print
-        yields belongs to THIS gap and no other."""
-        var = getattr(self, "_sw_circ_cts_var", None)
-        if var is None:
-            return
-        try:
-            lr = _finite(self.sw_vars["circ_lr"].get())
-            ap = _finite(self.sw_vars["circ_amp_prior"].get())
-            eps = [e for e in mew_sweeps.parse_float_list(
-                self.sw_vars["circ_eps"].get()) if e > 1.0]
-        except (tk.TclError, ValueError):
-            eps, lr, ap = [], 0.0, mew_circle_fit.A_DEFAULT
-        sizes = ""
-        if eps and lr > 0:
-            try:
-                radii = [mew_sweeps.circle_radius(e, gap, lr, ap) for e in eps]
-                insets = [r - (mew_circle_fit.contact_radius(r, e, gap=gap,
-                                                             amp=ap) or r)
-                          for e, r in zip(eps, radii)]
-                sizes = (f" · radii {min(radii):.1f}–{max(radii):.1f} mm, "
-                         f"inset {min(insets) * 1000:.0f}–"
-                         f"{max(insets) * 1000:.0f} µm")
-            except ValueError:
-                # a gap or prior the sizing law refuses (0, negative): the
-                # line reads without sizes rather than raising out of a trace
-                sizes = ""
-        # the CTS in the display unit (mm/min by default), as everywhere else
-        var.set(gui_units.localize(
-                f"Gap {gap:g} mm · CTS {cts:.4g} mm/s · physics "
-                f"{phys}{sizes}. The amplitude this yields is fitted AT "
-                f"{gap:g} mm and means nothing without it. Print at the "
-                f"gap you work at. Edit gap / CTS on the Physics page."))
-        # The specimen table's radii are functions of the gap and of the sizing
-        # dials, so it refreshes on the same beat this line does rather than on
-        # a trace of its own.
-        self._sw_circ_refresh_table()
-
     # human labels for the numeric fields, so a blank/garbage entry raises a
     # message that NAMES the field ("Plate width needs a number") instead of the
     # cryptic "could not convert string to float: ''" -- surfaced on the Sweeps
@@ -2525,6 +2379,11 @@ class _SweepsMixin:
         "circ_stab_eps": "Stabilization scaffold speed ×CTS",
         "exit_margin": "Exit distance", "faces": "Tube facets",
         "sag_reset_layers": "Reset sagging every",
+        "feed_speed": "Print feed", "feed_reps": "Lines on each slide",
+        "feed_pitch": "Line pitch",
+        "feed_col_gap": "Stabilization scaffold → lines gap",
+        "feed_line_len": "Line length",
+        "feed_base_speed": "Stabilization scaffold feed",
     }
 
     # ------------------------------------------------------------------ #
@@ -2626,6 +2485,20 @@ class _SweepsMixin:
                 base_speed=Fopt(p_ + "base_speed"),
                 bottom_up=bool(v[p_ + "bottom_up"].get()),
                 pressure_psi=press, **common)
+        elif kind == "feed":
+            # the feeder plate: the viscosity plate's geometry at ONE
+            # temperature, one slide per feeder rate (the slip check adds a
+            # second at twice the first)
+            rate = self._sw_feed_rate()
+            params = mew_sweeps.DiamParams(
+                temps=mew_sweeps.parse_float_list(v["feed_temp"].get())[:1],
+                feed_rates=([rate, 2.0 * rate] if v["feed_slip"].get()
+                            else [rate]),
+                speed=F("feed_speed"), reps=I("feed_reps"),
+                line_len=Fopt("feed_line_len"), pitch=F("feed_pitch"),
+                col_gap=F("feed_col_gap"),
+                base_speed=Fopt("feed_base_speed"),
+                bottom_up=bool(v["feed_bottom_up"].get()), **common)
         elif kind == "sag":
             # The span list is the design, so it is parsed leniently (the same
             # helper the ladder's temperatures use) rather than through `F`: a
@@ -3144,7 +3017,6 @@ class _SweepsMixin:
         if self.sw_print_index.get() > n:
             self.sw_print_index.set(n)      # clamp the pager into range
         self._sw_summary_var.set(res.summary)
-        self._sw_update_tube_note(res)
         # the bottom bar's Save g-code as… can write every slide now,
         # with or without a Generate (gui_shell._refresh_result_controls)
         refresh = getattr(self, "_refresh_result_controls", None)
@@ -3154,20 +3026,10 @@ class _SweepsMixin:
         self._sw_show_all()
 
     def _sw_render_warnings(self, res):
-        # a mandrel print's warnings are about its rod, and they belong under
-        # the rod rows of its own card (`_sw_rod_note_line`), not in the strip
-        notes = getattr(self, "_sw_rod_notes", {})
-
-        def sentence(w):
-            w = w.strip()
-            return (w[:1].upper() + w[1:]
-                    + ("" if w.endswith((".", "!", "?")) else "."))
-        for kind, vars_ in notes.items():
-            text = (" ".join(sentence(w) for w in res.warnings)
-                    if kind == res.kind else "")
-            for var in vars_:
-                var.set(text)
-        if res.kind in self._SW_ROTARY_KINDS and res.kind in notes:
+        # a mandrel print's warnings are about its rod (shrunk to fit, a band
+        # too short to settle): on a fixed rod that is the expected outcome,
+        # not an error, so only what it could not fit is said
+        if res.kind in self._SW_ROTARY_KINDS:
             self._sw_warn_var.set("  ·  ".join(res.oversize))
             return
         parts = list(res.oversize) + list(res.warnings)
@@ -3284,35 +3146,6 @@ class _SweepsMixin:
             diag=float(np.linalg.norm(hi - lo)),
             status=self._sw_status_line())
         self._sw_panel.apply_state(state, self._sw_subtitle(0))
-
-    def _sw_update_tube_note(self, res):
-        """The live line under "Tube design": each band's line count and the
-        spacing it is laid at, the gaps the model expects where it makes a
-        prediction, and the tube's length. Read off the RESULT, so it is what
-        the file holds rather than a second calculation of it."""
-        self._sw_update_tube_cts()
-        notes = getattr(self, "_sw_tube_notes", None)
-        if not notes or res is None or res.kind != "tube":
-            return
-        bands = []
-        for rec in res.rows:
-            if rec.get("section") != "meander":
-                continue
-            what = "rings" if rec["angle_deg"] >= 90.0 else "lines"
-            txt = "%g°%s: %d %s %.2f mm apart" % (
-                rec["angle_deg"],
-                " check" if rec.get("check_band") == "yes" else "",
-                rec["lines"], what, rec["spacing_mm"])
-            if rec.get("pred_wide_mm") is not None:
-                txt += " (model gaps: wide %.2f, narrow %.2f)" % (
-                    rec["pred_wide_mm"], max(0.0, rec["pred_narrow_mm"]))
-            bands.append(txt)
-        meta = res.prints[0]
-        text = ("%s. The tube is %.1f mm long."
-                % ("; ".join(bands) or "No bands",
-                   meta.bbox[2] - meta.bbox[0]))
-        for var in notes:
-            var.set(text)
 
     def _sw_subtitle(self, sel):
         """The preview's one short line: which print, and -- only when there
@@ -4089,7 +3922,7 @@ class _SweepsMixin:
     _SW_FILE_NAMES = {"cts": "cts_sweep", "cts4": "cts_mandrel",
                       "circle": "lag_circles", "tube": "lag_tube",
                       "diam": "temperature_ladder", "visc": "viscosity_plate",
-                      "sag": "sag_ladder"}
+                      "sag": "sag_ladder", "feed": "feeder_plate"}
 
     def _sw_default_name(self):
         """The print's file stem: Save offers it, Send stores it on the
@@ -4130,10 +3963,33 @@ class _SweepsMixin:
             return 0
         return len(res.gcode_texts)
 
-    @staticmethod
-    def _sw_rung_confirm(files, host):
+    def _sw_rung_rates(self, files):
+        """A feeder plate's rate per file, in order; None for a ladder."""
+        if self.sw_vars["kind"].get() != "feed":
+            return None
+        res = getattr(self, "_sw_result", None)
+        by_print = {}
+        for row in (res.rows if res is not None else ()):
+            by_print.setdefault(row.get("print"), row.get("feed_setting"))
+        return ["%g" % float(by_print[i]) if by_print.get(i) not in (None, "")
+                else "?" for i in range(1, len(files) + 1)]
+
+    def _sw_rung_confirm(self, files, host):
         """Asked where Send is pressed, before anything goes up: a ladder
         is several files, and each needs its temperature set first."""
+        rates = self._sw_rung_rates(files)
+        if rates is not None:
+            rows = "\n".join("    %s    feeder rate %s" % (fn, r)
+                             for (fn, _text, _t), r in zip(files, rates))
+            t = files[0][2] if files else None
+            return messagebox.askokcancel(
+                "Send the feeder plate",
+                "This plate goes to %s as %d files, one per feeder rate:\n\n"
+                "%s\n\nEach file's start block sets its own feeder rate. "
+                "None of them starts on its own. Set the nozzle heater "
+                "(extruder) to %s °C before the first."
+                % (host, len(files), rows,
+                   "%g" % float(t) if t not in (None, "") else "?"))
         rows = "\n".join(
             "    %s    %s °C" % (fn, "%g" % float(t) if t not in (None, "")
                                 else "?") for fn, _text, t in files)
@@ -4144,10 +4000,18 @@ class _SweepsMixin:
             "set the nozzle heater (extruder) to that file's temperature."
             % (host, len(files), rows))
 
-    @staticmethod
-    def _sw_rung_note(files, host):
+    def _sw_rung_note(self, files, host):
         """What Send says for a ladder: how many files, which temperature
         each one is for, and that nothing starts on its own."""
+        rates = self._sw_rung_rates(files)
+        if rates is not None:
+            return ("Sending %d files to %s, one per feeder rate: %s. Each "
+                    "sets its own rate. Nothing starts on its own. On the "
+                    "Printer link page, select a file under G-code files and "
+                    "press Start print."
+                    % (len(files), host, ", ".join(
+                        "%s at %s" % (fn, r)
+                        for (fn, _text, _t), r in zip(files, rates))))
         rungs = ", ".join(
             "%s at %s °C" % (fn, "%g" % float(t) if t not in (None, "")
                              else "?") for fn, _text, t in files)

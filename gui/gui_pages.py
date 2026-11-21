@@ -1302,9 +1302,10 @@ class _ModernPagesMixin:
         """A card's own jump to the Calibration page, pre-selected on the procedure
         that MEASURES this module's value. The generic 'Calibrate...' button this
         replaces landed on whichever card the page happened to be showing."""
-        ttk.Button(parent, text=label,
-                   command=lambda p=procedure: self._goto_calibration_page(p)).pack(
-            side="left", padx=(0, gui_fonts.SP["s"]))
+        b = ttk.Button(parent, text=label,
+                       command=lambda p=procedure: self._goto_calibration_page(p))
+        b.pack(side="left", padx=(0, gui_fonts.SP["s"]))
+        return b
 
     def _phys_reset_button(self, parent, title, sections=(), laws=()):
         """A card's own 'Reset to defaults', beside its Calibrate jumps.
@@ -1776,11 +1777,20 @@ class _ModernPagesMixin:
             return default
 
     def _summary_phys_process(self):
+        # the melt feed, as the card's own rows have it: the pressure, or a
+        # filament feeder's setting, or its E
+        mode = self._feed_mode()
+        if mode == "speed":
+            feed = "Feeder rate %s" % self._phys_cal("feed_setting", "?")
+        elif mode == "e":
+            feed = "fiber %s, per line (E)" % gui_units.show(
+                "fiber_d", self._phys_sim("sim_fiber_d", "?"), "mm")
+        else:
+            feed = gui_units.show("pressure",
+                                  self._phys_sim("sim_pressure", "?"), "psi")
         return " · ".join((
             "Gap %s mm" % self._phys_sim("sim_standoff", "?"),
-            "%s kV" % self._phys_sim("sim_voltage", "?"),
-            gui_units.show("pressure", self._phys_sim("sim_pressure", "?"),
-                           "psi"),
+            "%s kV" % self._phys_sim("sim_voltage", "?"), feed,
             "%s °C" % self._phys_sim("sim_temperature", "?")))
 
     PHYS_INTRO = ("Open a card to see its law, edit its constants or measure "
@@ -2290,6 +2300,23 @@ class _ModernPagesMixin:
         self._setup_focus["gcode_blocks"] = self._machine_start_text
         self._setup_focus["gcode_rules"] = self._machine_rules_library
 
+        # --- Material delivery ---------------------------------------------- #
+        # How this printer pushes the polymer out, with the command each way
+        # needs and the print's own number for it (the pressure, the Feeder
+        # rate, or the fiber diameter), which Physics › Process parameters
+        # shows too (`_delivery_rows`).
+        feed_card = getattr(self, "_build_delivery_card", None)
+        if callable(feed_card):
+            feed = grid.add("feed", "Material delivery", info=(
+                "How this printer pushes the polymer out of the nozzle: air "
+                "pressure, a filament feeder run at a rate you set (the "
+                "MEWron's OCTO1), or E on every printing line (Marlin, "
+                "Klipper, Duet). Each has its printer command here, with "
+                "Edit in flavors… to change it. The pressure, Feeder rate or "
+                "fiber diameter you print at is here and on Physics › Process "
+                "parameters: the same number in both places."))
+            feed_card(host(feed))
+
         # --- 5 Presets ----------------------------------------------------- #
         pre = grid.add("presets", "Presets", wide=True, info=(
             "Step 5: save this page as a named printer preset and reload it any "
@@ -2305,8 +2332,8 @@ class _ModernPagesMixin:
         # REQUIRED BEFORE OPTIONAL. Built in the order above (the collector
         # card reads widgets the model card made), drawn in the order a first
         # print needs them: the numbers are machine_setup.STEP_NO's.
-        grid.reorder(("setup", "collector", "gcode", "machine", "calibrate",
-                      "presets"))
+        grid.reorder(("setup", "collector", "gcode", "feed", "machine",
+                      "calibrate", "presets"))
         self._rotary_sections_built = True
         self._toggle_plate_shape()
 
@@ -2575,6 +2602,21 @@ class _ModernPagesMixin:
                 self._setup_items[it.key] = c
                 r += 1
 
+    def _summary_machine_feed(self):
+        """The Material delivery tile: the mode, the print's number for it,
+        and on a filament printer the filament."""
+        mode = self._feed_mode()
+        if mode == "pressure":
+            return "Pressure · " + gui_units.show(
+                "pressure", self._phys_sim("sim_pressure", "?"), "psi")
+        fil = "filament %s mm" % self._phys_cal("filament_diameter", "?")
+        fd = gui_units.show("fiber_d", self._phys_sim("sim_fiber_d", "?"),
+                            "mm")
+        if mode == "e":
+            return "Per line (E) · fiber %s · %s" % (fd, fil)
+        return "Filament rate · Feeder rate %s · %s" % (
+            self._phys_cal("feed_setting", "?"), fil)
+
     def _summary_machine_presets(self):
         try:
             table = self._pstores.get("machine", {}).get("table")
@@ -2609,6 +2651,7 @@ class _ModernPagesMixin:
                                                       True),
                          "collector": ms.card_summary(steps, "collector"),
                          "gcode": ms.card_summary(steps, "gcode"),
+                         "feed": self._summary_machine_feed(),
                          "presets": self._summary_machine_presets()}
             for key, text in summaries.items():
                 card = g.card(key)
@@ -2634,6 +2677,20 @@ class _ModernPagesMixin:
                 var.trace_add("write", self._refresh_machine_summaries)
             except (AttributeError, tk.TclError):
                 pass
+        # the Material delivery tile reads the feed keys and the print's number
+        for name in ("sim_pressure", "sim_fiber_d"):
+            var = getattr(self, name, None)
+            if var is not None:
+                var.trace_add("write", self._refresh_machine_summaries)
+        try:
+            import mew_calibration
+            for k in list(mew_calibration.MACHINE_FEED_KEYS) + [
+                    mew_calibration.KEY_PREFIX + "feed_setting"]:
+                var = getattr(self, "cal_vars", {}).get(k)
+                if var is not None:
+                    var.trace_add("write", self._refresh_machine_summaries)
+        except ImportError:
+            pass
 
     def _apply_all_toggles(self):
         """super() re-syncs every grey/hide state over the same widgets; then

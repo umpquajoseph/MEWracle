@@ -141,6 +141,17 @@ class _CalibrationMixin:
         # which values came from Calibrate (`mew_calibration.MEASURED_KEY`):
         # rides cal_vars for the same four reasons the law keys do
         self.cal_vars[mew_calibration.MEASURED_KEY] = tk.StringVar(value="")
+        # The MELT FEED (mew_calibration.FEED_FIELDS): the same one-var-per-field
+        # shape, so they persist with the Physics preset and reach every
+        # worker's profile exactly like a registry field. The mode is a string
+        # and rides its own key, as the law keys do.
+        for fs in mew_calibration.FEED_FIELDS:
+            self.cal_vars[fs.key] = tk.StringVar(
+                value=mew_calibration.fmt_value(fs.default))
+            if fs.gate_label:
+                self.cal_vars[fs.gate_key] = tk.BooleanVar(value=False)
+        self.cal_vars[mew_calibration.FEED_MODE_KEY] = tk.StringVar(
+            value="pressure")
         self.cal_show_advanced = tk.BooleanVar(value=False)
         self._fit_results = {}            # section name -> last computed value
         return True
@@ -258,10 +269,513 @@ class _CalibrationMixin:
                 self._cal_entries[fs.key] = r.field
         self._sync_cal_gates()
 
+    # -- material delivery (Setup › Printer & collector) --------------------- #
+    # ONE var holds the mode (`FEED_MODE_KEY`: "pressure" / "speed" / "e"),
+    # picked on the machine page's Material delivery card: Pressure, Filament
+    # rate or Per line (E). The card also holds the printer's command for
+    # each mode (the flavor's, with a jump to edit it), the filament and the
+    # feeder's drive train. The PRINT's number for the mode -- the pressure,
+    # the Feeder rate, or the fiber diameter to design for -- is drawn from
+    # the same vars twice: on the card and on Physics › Process parameters
+    # (`_delivery_rows`). Every mode-dependent row is in `_feed_rows` as
+    # (row, shown(mode, design)) and `_apply_feed_mode_ui` shows or hides it.
+    DELIVERY_MODES = (("pressure", "Pressure"), ("speed", "Filament rate"),
+                      ("e", "Per line (E)"))
+    _DELIVERY_TIP = (
+        "How this printer pushes the polymer out of the nozzle.\n\n"
+        "Pressure: air pressure on a syringe. The flow comes from the "
+        "pressure, the needle and the melt's viscosity.\n\n"
+        "Filament rate: a motor feeds filament at a rate one command sets and "
+        "holds (the MEWron's OCTO1 600). Whatever goes in comes out as fiber, "
+        "so the flow is the filament's area times the feed speed, and a "
+        "faster print speed makes a thinner fiber.\n\n"
+        "Per line (E): the firmware moves the filament by the E value on each "
+        "printing line, in step with the head (Marlin, Klipper, Duet). You "
+        "type the fiber diameter and Generate writes the E values for it.")
+    #: (mode, flavor field, row label) of each mode's printer command
+    _DELIVERY_COMMANDS = (("pressure", "pressure", "Pressure command"),
+                          ("speed", "feed", "Feeder command"),
+                          ("e", "extrude_word", "Extrusion word"))
+
+    def _delivery_vars(self):
+        """The print's delivery numbers both cards draw, made by whichever is
+        built first (Setup is built before the Physics page, whose
+        `_populate_sim_controls` reuses them): the pressure, the fiber
+        diameter to design for, and Filament rate's "Design for a fiber
+        diameter" switch. All three ride the physics preset."""
+        d = self.__dict__
+        if "sim_pressure" not in d:
+            self.sim_pressure = tk.StringVar(value="3")
+        if "sim_fiber_d" not in d:
+            self.sim_fiber_d = tk.StringVar(value="0.02")
+        if "sim_design_d" not in d:
+            self.sim_design_d = tk.BooleanVar(value=False)
+        if not d.get("_delivery_traced"):
+            self._delivery_traced = True
+            self.sim_fiber_d.trace_add("write", self._on_delivery_change)
+            self.sim_design_d.trace_add("write", self._on_delivery_change)
+            self.sim_design_d.trace_add(
+                "write", lambda *_a: self._apply_feed_mode_ui())
+
+    def _delivery_rows(self, F, where):
+        """The print's number for the delivery mode, on Form `F`: the Polymer
+        delivery card (`where` "card") or Physics › Process parameters
+        ("process", whose own Pressure row is `_press_row`). Pressure shows
+        the pressure; Filament rate the Feeder rate with the fiber it makes,
+        or with "Design for a fiber diameter" the diameter you type and the
+        rate that makes it; Per line the diameter and the E it writes."""
+        if not self._init_calibration_vars():
+            return
+        self._delivery_vars()
+        rows = self.__dict__.setdefault("_feed_rows", {})
+        p = where + "."
+        if where == "card":
+            r = F.entry("Pressure", self.sim_pressure,
+                        "The air pressure you print at. The same number as "
+                        "Pressure on Physics › Process parameters.",
+                        unit="psi")
+            rows[p + "pressure"] = (r, lambda m, d: m == "pressure")
+        var = self.cal_vars[mew_calibration.KEY_PREFIX + "feed_setting"]
+        r = F.entry("Feeder rate", var,
+                    "The number the feeder command sends: the 600 in OCTO1 "
+                    "600. It is a motor speed held until the next command, so "
+                    "it sets the flow, and the flow and the print speed set "
+                    "the fiber.\n\nWith “Design for a fiber diameter” ticked "
+                    "it is worked out for you, rounded to a whole number.")
+        self.__dict__.setdefault("_feed_setting_fields", []).append(r.field)
+        rows[p + "setting"] = (r, lambda m, d: m == "speed")
+        c = F.check("Design for a fiber diameter", self.sim_design_d,
+                    "Type the fiber diameter you want instead, and the "
+                    "Feeder rate that makes it at scaffold 1's print speed is "
+                    "worked out and written for you.")
+        rows[p + "design"] = (c, lambda m, d: m == "speed")
+        r = F.entry("Fiber diameter", self.sim_fiber_d,
+                    "The fiber you want. Per line (E): every scaffold is "
+                    "printed at it, and Generate writes the E that makes it. "
+                    "Filament rate: the Feeder rate is worked out to make it "
+                    "at scaffold 1's print speed.", unit="mm")
+        if where == "card":
+            self._delivery_fiber_entry = r.field
+        rows[p + "fiber_d"] = (r, lambda m, d: m == "e" or (m == "speed"
+                                                            and d))
+        out = self.__dict__.setdefault("_delivery_out",
+                                       tk.StringVar(value=""))
+        rows[p + "out"] = (F.live(None, textvariable=out),
+                           lambda m, d: m in ("speed", "e"))
+
+    def _build_delivery_card(self, parent):
+        """Setup › Printer & collector › Material delivery: the mode, each
+        mode's printer command with a jump to edit it in the flavor, the
+        print's number for the mode (`_delivery_rows`), the filament, the
+        feeder's drive train and measured feed, the feed test that measures
+        it with no print (`_apply_feed_test`) beside the jump to Calibrate's
+        printed-line Fiber diameter (filament) type, and Per line (E)'s
+        firmware check. The printer's half rides the machine preset
+        (`MACHINE_FEED_KEYS`); the print's numbers ride the physics one."""
+        if not self._init_calibration_vars():
+            return
+        self._feed_rows = getattr(self, "_feed_rows", {})
+        if not hasattr(self, "_cal_entries"):
+            self._cal_entries = {}
+        rows = self._feed_rows
+        mode_var = self.cal_vars[mew_calibration.FEED_MODE_KEY]
+        F = gui_form.Form(parent)
+        g = F.group("Delivery", self._DELIVERY_TIP)
+        for value, text in self.DELIVERY_MODES:
+            g.add_radio(text, mode_var, value, self._DELIVERY_TIP)
+        # each mode's command, the flavor's words, with a jump to change them
+        self._delivery_cmd_vars = {}
+        for mode, field, label in self._DELIVERY_COMMANDS:
+            cv = tk.StringVar(value="")
+            self._delivery_cmd_vars[mode] = cv
+            row = F.group(label, self._flavor_tip(field))
+            row.add_widget(ttk.Label(row.host(), textvariable=cv),
+                           kind="live")
+            row.add_button("Edit in flavors…",
+                           lambda f=field: self._edit_flavor_field(f),
+                           "Open this printer's flavor in the flavor editor "
+                           "at this command, to change it or set one.")
+            rows["card.cmd_" + mode] = (row, lambda m, d, mm=mode: m == mm)
+        self._delivery_rows(F, "card")
+        by = {fs.attr: fs for fs in mew_calibration.FEED_FIELDS}
+        speed_only = ("feed_motor_gearbox", "feed_gear_ratio",
+                      "feed_rotation_distance", "feed_microsteps",
+                      "feed_full_steps", "feed_unit_steps",
+                      "feed_rate_measured")
+        for attr in ("filament_diameter",) + speed_only:
+            fs = by[attr]
+            shown = ((lambda m, d: m == "speed") if attr in speed_only
+                     else (lambda m, d: m in ("speed", "e")))
+            if fs.gate_label:
+                gr = F.check(fs.gate_label, self.cal_vars[fs.gate_key],
+                             "Tick to use a feed you measured instead of the "
+                             "gear-train calculation.\n\n" + fs.desc,
+                             command=self._sync_cal_gates)
+                rows["gate_" + attr] = (gr, shown)
+            r = F.entry(fs.label, self.cal_vars[fs.key], fs.desc,
+                        unit=fs.unit, indent=(1 if fs.gate_label else 0))
+            gui_units.bind_rounded(r.field, self.cal_vars[fs.key])
+            if fs.gate_label:
+                self._cal_entries[fs.key] = r.field
+            rows[attr] = (r, shown)
+        self._feed_readout = tk.StringVar(value="")
+        rows["readout"] = (F.live("Feed per unit",
+                                  textvariable=self._feed_readout,
+                                  tip="What one unit of the Feeder rate "
+                                      "feeds, from the fields above (or the "
+                                      "measured value when it is ticked)."),
+                           lambda m, d: m == "speed")
+        # -- the feed test: the measured feed with no print. Calibrate's
+        # feeder type opens with a link here (`LEAD_LINKS`), and its own
+        # printed-line method is the button beside Apply.
+        speed = lambda m, d: m == "speed"                      # noqa: E731
+        rows["ft_head"] = (F.section("Feed test"), speed)
+        rows["ft_steps"] = (F.live(None, text=self._FEED_TEST_STEPS), speed)
+        self._ft_rate = tk.StringVar(value="")
+        self._ft_min = tk.StringVar(value="")
+        self._ft_mm = tk.StringVar(value="")
+        r = F.entry("Feeder rate run", self._ft_rate,
+                    "The Feeder rate you ran the test at: the 20000 in "
+                    "OCTO1 20000.")
+        self._delivery_feed_test_entry = r.field
+        rows["ft_rate"] = (r, speed)
+        rows["ft_min"] = (F.entry("Time run", self._ft_min,
+                                  "How long the feeder ran at that rate.",
+                                  unit="min"), speed)
+        rows["ft_mm"] = (F.entry("Filament fed", self._ft_mm,
+                                 "How far the mark on the filament moved in "
+                                 "that time.", unit="mm"), speed)
+        bar = ttk.Frame(F.frame)
+        ttk.Button(bar, text="Apply", command=self._apply_feed_test
+                   ).pack(side="left")
+        ttk.Button(bar, text="Calibrate with a print instead…",
+                   command=lambda: self._goto_calibration_page("feeder")
+                   ).pack(side="left", padx=(gui_fonts.SP["s"], 0))
+        rows["measure"] = (F.slot(None, bar), speed)
+        self._ft_out = tk.StringVar(value="")
+        rows["ft_out"] = (F.live(None, textvariable=self._ft_out), speed)
+        # Per line (E): the firmware's check, not a MEWracle value
+        try:
+            import calibration_procedures as cp
+            e_check = cp.E_MODE_CHECK
+        except (ImportError, AttributeError):
+            e_check = ""
+        if e_check:
+            rows["e_check"] = (F.live(None, text=e_check),
+                               lambda m, d: m == "e")
+        for var in self.cal_vars.values():
+            var.trace_add("write", self._on_delivery_change)
+        mode_var.trace_add("write", self._on_delivery_mode)
+        flavor = getattr(self, "gcode_flavor", None)
+        if flavor is not None:
+            flavor.trace_add("write",
+                             lambda *_a: self._refresh_delivery_commands())
+        self._sync_cal_gates()
+        self._apply_feed_mode_ui()
+
+    #: how to run the card's feed test, shown above its three boxes
+    _FEED_TEST_STEPS = (
+        "Measures the feed per unit with no print.\n"
+        "1. Heat the nozzle to your print temperature.\n"
+        "2. Put a fine mark on the filament where it enters the feeder.\n"
+        "3. Send the Feeder command above at a high rate, for example "
+        "OCTO1 20000 on a MEWron, and time it. About 10 minutes is enough.\n"
+        "4. Stop the feeder and measure how far the mark moved, in mm.\n"
+        "5. Enter the rate, the time and the length below and press Apply. "
+        "It ticks “Use a measured value” and fills it in.")
+
+    def _apply_feed_test(self):
+        """The card's feed test: mm of filament fed / minutes run / the
+        Feeder rate it ran at = mm/min of filament per unit of rate. The
+        filament's own travel is the measurement, so no print and no
+        microscope. Writes `feed_rate_measured` and ticks its "Use a measured
+        value", exactly as Calibrate's printed-line Apply does."""
+        try:
+            n, minutes, mm = (float(v.get()) for v in
+                              (self._ft_rate, self._ft_min, self._ft_mm))
+            if not all(math.isfinite(x) and x > 0.0 for x in (n, minutes, mm)):
+                raise ValueError
+        except (ValueError, tk.TclError):
+            self._ft_out.set("Enter the Feeder rate run, the time run and the "
+                             "filament fed, all above 0.")
+            return
+        val = mm / minutes / n
+        key = mew_calibration.KEY_PREFIX + "feed_rate_measured"
+        fs = mew_calibration._BY_KEY.get(key)
+        gate = self.cal_vars.get(fs.gate_key) if fs is not None else None
+        if gate is not None:
+            gate.set(True)
+        self._cal_apply(key, val, name="Feed per unit (measured)")
+        self._sync_cal_gates()
+        self._ft_out.set("Feed per unit = %.5g mm/min of filament per unit of "
+                         "Feeder rate (%g mm in %g min at %g). Applied."
+                         % (val, mm, minutes, n))
+        self.status.set(
+            "Applied ‘Feed per unit (measured)’ from the feed test. Save your "
+            "printer preset on Setup › Printer & collector to keep it for the "
+            "next start.")
+
+    def _edit_flavor_field(self, field):
+        """The card's "Edit in flavors…": this printer's flavor, open in the
+        flavor editor at `field`'s row."""
+        try:
+            label = self.gcode_flavor.get()
+        except (AttributeError, tk.TclError):
+            label = None
+        ed = self._open_flavor_editor(select=label)
+        focus = getattr(ed, "focus_field", None)
+        if callable(focus):
+            focus(field)
+
+    @staticmethod
+    def _flavor_tip(field):
+        try:
+            import mew_gcode
+            return mew_gcode.FLAVOR_TIPS.get(field, "")
+        except ImportError:
+            return ""
+
+    def _delivery_flavor(self):
+        try:
+            import mew_gcode
+            return mew_gcode.get_flavor(self._machine_flavor_name())
+        except (AttributeError, ImportError, KeyError):
+            return None
+
+    def _refresh_delivery_commands(self):
+        """Each mode's command line, as this printer's flavor spells it."""
+        cvs = getattr(self, "_delivery_cmd_vars", None)
+        fl = self._delivery_flavor()
+        if not cvs or fl is None:
+            return
+        cvs["pressure"].set(
+            "%s  (%s)" % (fl.pressure, fl.label) if fl.pressure.strip() else
+            "None in %s, so no pressure command is written. Add one if "
+            "your printer sets the pressure by command." % fl.label)
+        cvs["speed"].set(
+            "%s  (%s)" % (fl.feed, fl.label) if fl.feed.strip() else
+            "None in %s. Generate refuses until you add the command your "
+            "feeder takes." % fl.label)
+        cvs["e"].set(
+            "%s, read as %s  (%s)" % (fl.extrude_word, fl.e_rule, fl.label)
+            if fl.extrude_word and fl.e_rule else
+            "None in %s, so it cannot write E. Add an extrusion word and "
+            "how it reads." % fl.label)
+
+    def _refresh_cal_delivery_notes(self):
+        """Each Calibrate type's line saying what its value does not do under
+        this printer's delivery; blank when it applies."""
+        notes = getattr(self, "_cal_delivery_notes", None)
+        if not notes:
+            return
+        try:
+            import calibration_procedures as cp
+            say = cp.DELIVERY_NOTES.get(self._feed_mode(), {})
+        except (ImportError, AttributeError):
+            say = {}
+        for key, var in notes.items():
+            try:
+                var.set(say.get(key, ""))
+            except tk.TclError:
+                pass
+
+    def _on_delivery_mode(self, *_a):
+        """The mode changed (a click or a preset): show its rows, and settle
+        the scaffold diameters (`_apply_diam_mode`)."""
+        self._apply_feed_mode_ui()
+        self._refresh_cal_delivery_notes()
+        apply = getattr(self, "_apply_diam_mode", None)
+        if callable(apply) and getattr(self, "scaf_vars", None):
+            apply()
+
+    def _on_delivery_change(self, *_a):
+        """A delivery number changed: Filament rate designing for a diameter
+        writes the Feeder rate that makes it; Per line pushes the diameter
+        into every scaffold; both refresh the result line."""
+        if getattr(self, "_delivery_busy", False) or getattr(
+                self, "_loading_preset", False):
+            return
+        self._delivery_busy = True
+        try:
+            mode = self._feed_mode()
+            if mode == "speed" and self._delivery_design():
+                n = self._feed_setting_for_target()
+                if n is not None:
+                    var = self.cal_vars[mew_calibration.KEY_PREFIX
+                                        + "feed_setting"]
+                    if var.get() != str(n):
+                        var.set(str(n))
+            elif mode == "e":
+                push = getattr(self, "_push_target_diam", None)
+                if callable(push):
+                    push()
+        finally:
+            self._delivery_busy = False
+        self._refresh_feed_readout()
+
+    def _delivery_design(self):
+        try:
+            return bool(self.sim_design_d.get())
+        except (AttributeError, tk.TclError):
+            return False
+
+    def _delivery_model(self):
+        mat, noz, cal = mew_calibration.models_from_profile(
+            self._calibration_profile_snapshot())
+        return MEWModel(material=mat, nozzle=noz, calibration=cal)
+
+    def _scaffold_speeds(self):
+        """[(scaffold number, print speed mm/min)] of the Design page's live
+        scaffolds; a blank or unreadable speed is left out."""
+        out = []
+        for i, v in enumerate(getattr(self, "scaf_vars", ())[
+                :max(1, self._scaffold_count_safe())]):
+            try:
+                s = float(v["speed"].get())
+            except (KeyError, ValueError, tk.TclError):
+                continue
+            if s > 0.0:
+                out.append((i + 1, s))
+        return out
+
+    def _feed_setting_for_target(self):
+        """The whole-number Feeder rate that prints the typed fiber diameter
+        at scaffold 1's print speed, or None when a field is unreadable.
+        Mass conservation, Q = (pi/4) d^2 v, inverted through `feed_flow`
+        (linear in the setting); a user-replaced diameter law is solved by
+        bisection on the setting instead."""
+        try:
+            d = float(self.sim_fiber_d.get())
+            speeds = self._scaffold_speeds()
+            if not (d > 0.0 and speeds):
+                return None
+            v = speeds[0][1] / 60.0
+            model = self._delivery_model()
+            n = model.feed_setting_for(0.25 * math.pi * d * d * v)
+
+            def d_at(s):
+                return model.fiber_diameter(model.feed_flow(s), v)
+
+            if not (n > 0.0 and math.isfinite(n)):
+                return None
+            if abs(d_at(n) - d) > 1e-6 * d:
+                lo, hi = 0.0, n
+                for _ in range(80):
+                    if d_at(hi) >= d:
+                        break
+                    hi *= 2.0
+                for _ in range(80):
+                    mid = 0.5 * (lo + hi)
+                    if d_at(mid) < d:
+                        lo = mid
+                    else:
+                        hi = mid
+                n = hi
+        except (AttributeError, ValueError, ZeroDivisionError, tk.TclError):
+            return None
+        return max(1, int(round(n)))
+
+    @staticmethod
+    def _um(d_mm):
+        return "%.1f µm" % (d_mm * 1000.0)
+
+    def _refresh_feed_readout(self, *_a):
+        """The card's Feed per unit line and, on both cards, the result line:
+        the fiber the Feeder rate makes at each scaffold's speed (Filament
+        rate), or the filament per mm of fiber Generate writes (Per line)."""
+        out = getattr(self, "_feed_readout", None)
+        model = None
+        try:
+            model = self._delivery_model()
+            per = model.feed_rate_per_unit()
+            if out is not None:
+                ul_h = model.filament_area() * per * 60.0
+                out.set("%.4g mm/min of filament = %.4g µL/h per unit"
+                        % (per, ul_h))
+        except (ValueError, ZeroDivisionError, tk.TclError):
+            if out is not None:
+                out.set("— (check the fields above)")
+        res = getattr(self, "_delivery_out", None)
+        if res is None:
+            return
+        mode = self._feed_mode()
+        text = ""
+        if mode == "speed":
+            text = self._delivery_speed_text(model)
+        elif mode == "e":
+            r = self._feed_e_per_mm()
+            text = ("Generate writes E = %.4g mm of filament per mm of fiber "
+                    "on every scaffold." % r if r else
+                    "— (type the fiber diameter and the filament diameter)")
+        res.set(text)
+
+    def _delivery_speed_text(self, model):
+        """Filament rate's result line: the fiber at each scaffold's speed."""
+        try:
+            n = float(self.cal_vars[mew_calibration.KEY_PREFIX
+                                    + "feed_setting"].get())
+            q = model.feed_flow(n)
+        except (AttributeError, KeyError, ValueError, ZeroDivisionError,
+                tk.TclError):
+            return "— (check the Feeder rate and the filament fields)"
+        if not q > 0.0:
+            return "The feeder is stopped at this Feeder rate: no fiber."
+        parts = []
+        for k, s in self._scaffold_speeds():
+            try:
+                d = model.fiber_diameter(q, s / 60.0)
+            except ValueError:
+                continue
+            parts.append("%s at %g mm/min (scaffold %d)" % (self._um(d), s, k))
+        if not parts:
+            return "— (scaffold 1 has no print speed)"
+        lead = ("Feeder rate %g makes " % n if self._delivery_design()
+                else "Projected fiber: ")
+        return lead + "; ".join(parts) + "."
+
+    def _scaffold_count_safe(self):
+        try:
+            return int(self._scaffold_count())
+        except Exception:  # noqa: BLE001
+            return 1
+
+    def _apply_feed_mode_ui(self):
+        """Show the rows of the current delivery mode and hide the others;
+        grey the Feeder rate while it is worked out from a diameter."""
+        mode = self._feed_mode()
+        design = self._delivery_design()
+        for key, (row, shown) in getattr(self, "_feed_rows", {}).items():
+            try:
+                row.show(bool(shown(mode, design)))
+            except (tk.TclError, AttributeError):
+                pass
+        for field in getattr(self, "_feed_setting_fields", ()):
+            try:
+                field.configure(state="disabled" if design else "normal")
+            except tk.TclError:
+                pass
+        press = getattr(self, "_press_row", None)
+        if press is not None:
+            try:
+                press.show(mode == "pressure")
+            except tk.TclError:
+                pass
+        # the Process card's rig picture: a pressure arrow, or the filament feed
+        grid = getattr(self, "_physics_grid", None)
+        try:
+            fig = getattr(grid.card("process"), "_figure", None) if grid else None
+        except (KeyError, AttributeError, tk.TclError):
+            fig = None
+        if fig is not None:
+            fig.set_key("process" if mode == "pressure" else "process_feed")
+        self._refresh_delivery_commands()
+        self._refresh_feed_readout()
+
     def _sync_cal_gates(self):
         """Grey every gated calibration entry whose tickbox is off. Safe to call
         before the widgets exist (a preset load can land first)."""
-        for fs in mew_calibration.CALIBRATION_FIELDS:
+        for fs in (mew_calibration.CALIBRATION_FIELDS
+                   + mew_calibration.FEED_FIELDS):
             if not fs.gate_label:
                 continue
             ent = getattr(self, "_cal_entries", {}).get(fs.key)
@@ -443,7 +957,9 @@ class _CalibrationMixin:
         The printhead elevation and accel-planner knobs stay on the MACHINE preset. This
         is also what makes "calibration" a real preset kind in gui_presets and supplies
         the flat comparison grid's columns."""
-        return (list(getattr(self, "cal_vars", {}))
+        # the melt feed's printer half rides the MACHINE preset instead
+        return ([k for k in getattr(self, "cal_vars", {})
+                 if k not in mew_calibration.MACHINE_FEED_KEYS]
                 + list(self._physics_process_persist_keys()))
 
     def _calibration_grid_labels(self):
@@ -466,10 +982,88 @@ class _CalibrationMixin:
         never silently re-enable a split the user unticked, and unticking cannot lose
         the typed value."""
         snap = {k: v.get() for k, v in getattr(self, "cal_vars", {}).items()}
-        for fs in (mew_calibration.CALIBRATION_FIELDS if _HAVE_CAL else ()):
+        for fs in ((mew_calibration.CALIBRATION_FIELDS
+                    + mew_calibration.FEED_FIELDS) if _HAVE_CAL else ()):
             if fs.gate_label and not snap.get(fs.gate_key):
                 snap[fs.key] = ""
+        # E mode's nominal filament-per-mm, from the design's first fiber
+        # diameter: what an E file is written with (`_feed_e_per_mm`).
+        if _HAVE_CAL:
+            e_per_mm = getattr(self, "_feed_e_per_mm", lambda: None)()
+            if e_per_mm:
+                snap[mew_calibration.FEED_E_KEY] = repr(e_per_mm)
         return snap
+
+    def _feed_mode(self):
+        """"pressure", "speed" or "e": Setup's Material delivery choice."""
+        var = getattr(self, "cal_vars", {}).get(
+            getattr(mew_calibration, "FEED_MODE_KEY", ""))
+        mode = str(var.get() if var is not None else "pressure").strip()
+        return mode if mode in ("pressure", "speed", "e") else "pressure"
+
+    def _feed_e_per_mm(self, diameter=None):
+        """E mode: mm of filament per mm of fiber for `diameter` (default the
+        Material delivery card's Fiber diameter, else the first scaffold's),
+        or None outside E mode or on a blank field. (d / d_fil)^2,
+        `MEWModel.e_per_mm_for`."""
+        if self._feed_mode() != "e":
+            return None
+        try:
+            if diameter is None:
+                fd = getattr(self, "sim_fiber_d", None)
+                diameter = float(fd.get() if fd is not None
+                                 else self.scaf_vars[0]["diameter"].get())
+            d_fil = float(self.cal_vars[
+                mew_calibration.KEY_PREFIX + "filament_diameter"].get())
+        except (AttributeError, IndexError, KeyError, ValueError, tk.TclError):
+            return None
+        if not (d_fil > 0.0 and diameter > 0.0):
+            return None
+        return (float(diameter) / d_fil) ** 2
+
+    def _extrude_options(self, use_gce=False, gcode_path=None):
+        """`mew_gcode.OutputOptions.extrude` for "Per line (E)", or None in
+        any other feed. One ratio per scaffold, from its typed fiber
+        diameter (the Design page's, or the G-code CAD window's with
+        `use_gce`); a mandrel's radius, for the length a turn lays; and,
+        when `gcode_path` has the generator's line map beside it
+        (`<path>.linemap.json`, written by Generate in this feed), where
+        each scaffold starts. With no map every move takes scaffold 1's."""
+        if self._feed_mode() != "e":
+            return None
+        try:
+            if use_gce and hasattr(self, "gce_scaf_vars"):
+                groups = self.gce_scaf_vars[:self._gce_scaffold_count()]
+            else:
+                groups = self.scaf_vars[:self._scaffold_count()]
+        except (AttributeError, tk.TclError):
+            groups = []
+        ratios = []
+        for g in groups:
+            try:
+                r = self._feed_e_per_mm(float(g["diameter"].get()))
+            except (KeyError, ValueError, tk.TclError):
+                r = None
+            ratios.append(r or 0.0)
+        if not any(ratios):
+            return None
+        radius = 0.0
+        if getattr(self, "_mandrel_is_active", lambda: False)():
+            try:
+                radius = 0.5 * float(self.m_diameter.get())
+            except (AttributeError, ValueError, tk.TclError):
+                radius = 0.0
+        ex = {"ratios": ratios, "radius": radius, "starts": []}
+        if gcode_path:
+            try:
+                import mew_gcode
+                lm = mew_gcode.LineMap.load(gcode_path + ".linemap.json")
+                ex["starts"] = [[int(m["line"]), int(m["group"])]
+                                for m in lm.marks if m.get("kind") == "group"]
+                ex["n_lines"] = lm.n_lines
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        return ex
 
     def _calibration_models(self):
         """(Material, Nozzle, Calibration) from the current fields, for the
@@ -498,7 +1092,9 @@ class _CalibrationMixin:
         if not _HAVE_CAL or not getattr(self, "cal_vars", None):
             return None
         snap = self._calibration_profile_snapshot()
-        for fs in mew_calibration.CALIBRATION_FIELDS:
+        mode = self._feed_mode()
+        feed_fields = mew_calibration.FEED_FIELDS if mode != "pressure" else []
+        for fs in mew_calibration.CALIBRATION_FIELDS + feed_fields:
             raw = str(snap.get(fs.key, "")).strip()
             if not raw:
                 continue
@@ -507,13 +1103,97 @@ class _CalibrationMixin:
             except ValueError:
                 ok = False
             if not ok:
-                return ("Physics page: “%s” must be a number (it reads “%s”)."
-                        % (fs.label, raw))
+                # the feed's fields live on Setup's Material delivery card
+                where = ("Setup › Material delivery" if fs in feed_fields
+                         else "Physics page")
+                return ("%s: “%s” must be a number (it reads “%s”)."
+                        % (where, fs.label, raw))
         try:
             mat, noz, cal = mew_calibration.models_from_profile(snap)
-            MEWModel(material=mat, nozzle=noz, calibration=cal)
+            model = MEWModel(material=mat, nozzle=noz, calibration=cal)
         except ValueError as exc:
             return "Physics page: %s." % exc
+        try:
+            if mode != "pressure":
+                model.filament_area()
+            if mode == "e":
+                err = self._extrude_refusal()
+                if err:
+                    return err
+            if mode == "speed":
+                model.feed_rate_per_unit()
+                if not cal.feed_setting > 0.0:
+                    return ("Setup › Material delivery: “Feeder rate” "
+                            "must be more than 0: at 0 the feeder is stopped "
+                            "and no fiber is drawn.")
+                fl = self._delivery_flavor()
+                if fl is not None and not fl.feed.strip():
+                    return ("Setup › Material delivery: %s has no feeder "
+                            "command, so the Feeder rate would not be "
+                            "written. Press “Edit in flavors…” beside "
+                            "“Feeder command” and type your feeder's, e.g. "
+                            "OCTO1 {value}." % fl.label)
+        except ValueError as exc:
+            return "Setup › Material delivery: %s." % exc
+        return None
+
+    def _feed_read_args(self):
+        """--e-rule and, on a filament print, --feed-spec for the converter
+        reading an OPENED file (`gcode_to_fibers.FeedSpec`): the Setup page's
+        flavor says how E reads and which word is the feeder's command; the
+        Material delivery card gives the filament, the drive train and the
+        setting before the file sets one. A designed print is not read this
+        way: its diameters are the ones typed, and the feed is written at
+        Save."""
+        try:
+            import mew_gcode
+            fl = mew_gcode.get_flavor(self._machine_flavor_name())
+        except (AttributeError, ImportError):
+            return []
+        out = []
+        if fl.e_rule:
+            out += ["--e-rule", fl.e_rule]
+        mode = self._feed_mode()
+        if mode == "pressure" or not _HAVE_CAL:
+            return out
+        try:
+            mat, noz, cal = mew_calibration.models_from_profile(
+                self._calibration_profile_snapshot())
+            model = MEWModel(material=mat, nozzle=noz, calibration=cal)
+            spec = {"mode": mode, "d_fil": cal.filament_diameter,
+                    "extrude_word": fl.extrude_word or "E"}
+            if mode == "speed":
+                spec.update(word=mew_gcode._template_word(fl.feed),
+                            rate=model.feed_rate_per_unit(),
+                            setting=cal.feed_setting)
+        except (ValueError, AttributeError):
+            return out
+        return out + ["--feed-spec", json.dumps(spec)]
+
+    def _extrude_refusal(self):
+        """Why "Per line (E)" cannot write this print, or None: the
+        flavor reads no extrusion word (Aerotech's E is the rotary rate,
+        GRBL has none), or the collector is the curved five-axis one, whose
+        moves lay a surface length only the generator knows."""
+        try:
+            import mew_gcode
+            fl = mew_gcode.get_flavor(self._machine_flavor_name())
+        except (AttributeError, ImportError):
+            return None
+        if not (fl.extrude_word and fl.e_rule):
+            return ("Setup › Material delivery: the delivery is “Per line "
+                    "(E)”, but %s has no extrusion word. Pick Filament rate, "
+                    "or press “Edit in flavors…” beside “Extrusion word” "
+                    "and fill in the word and how it reads." % fl.label)
+        surf = getattr(self, "_surface_is_active", None)
+        try:
+            on = bool(surf()) if callable(surf) else False
+        except tk.TclError:
+            on = False
+        if on:
+            return ("Setup › Material delivery: “Per line (E)” is not "
+                    "written for the curved collector yet. Pick Filament "
+                    "rate, or design on the flat plate or the mandrel.")
         return None
 
     def _calibration_args(self):
@@ -727,7 +1407,7 @@ class _CalibrationMixin:
     #: same overflow that had to be taken off the lag3 card.
     _FIT_REP_COLS_MAX = 12
 
-    def _fit_rep_cells(self, F, label, tip, unit=None, width=7):
+    def _fit_rep_cells(self, F, label, tip, unit=None, width=7, row_out=None):
         """A labelled row of `_FIT_REP_COLS_MAX` diameter Entries.
 
         `_cal_sync_diam_fit` grids only as many as the plate lays and BLANKS the
@@ -736,6 +1416,8 @@ class _CalibrationMixin:
         group frame (that is what lets the sync hide them), so they are made
         here rather than with `row.add_entry`, which packs."""
         row = F.group(label, tip, unit=unit)
+        if row_out is not None:
+            row_out.append(row)         # a caller that hides the whole row
         holder = row.host()
         variables, widgets = [], []
         for i in range(self._FIT_REP_COLS_MAX):
@@ -1657,6 +2339,33 @@ class _CalibrationMixin:
             except tk.TclError:
                 pass
 
+        # the feeder plate: one cell per line on each slide, the slip slide's
+        # row only while the design lays it, and the rate and speed it is
+        # printed at
+        if getattr(self, "_fit_feed_diams", None) and "feed_reps" in sw:
+            n_feed = self._cal_rep_count(sw, "feed_reps")
+            slip = bool(sw["feed_slip"].get())
+            self._cal_sync_rep_cells(n_feed, self._fit_feed_diam_widgets,
+                                     self._fit_feed_diams)
+            self._cal_sync_rep_cells(n_feed if slip else 0,
+                                     self._fit_feed_slip_widgets,
+                                     self._fit_feed_slip_diams)
+            row = getattr(self, "_fit_feed_slip_row", None)
+            if row is not None:
+                row.show(slip)
+            try:
+                rate = self._sw_feed_rate()
+            except (ValueError, tk.TclError, KeyError, AttributeError):
+                rate = None
+            if rate:
+                seed("feed_n", self._fit_feed_n, "%g" % rate)
+            try:
+                fv = float(sw["feed_speed"].get())
+            except (tk.TclError, ValueError, KeyError):
+                fv = 0.0
+            if fv > 0:
+                seed("feed_v", self._fit_feed_v, "%g" % round(fv / 60.0, 4))
+
     #: a nozzle temperature outside this, in degC, is a typo or kelvin
     _EA_T_C = (20.0, 400.0)
 
@@ -1974,6 +2683,111 @@ class _CalibrationMixin:
     #: the operator adds and removes rows like the lag-circle card.
     _FUSION_FIT_ROWS = 2
 
+    #: how far apart the two slides' feed per unit may be, as a fraction of
+    #: slide 1's, before the slip check calls it slipping. A diameter read to
+    #: about 5% is a flow (d squared) read to about 10%.
+    _FEED_SLIP_TOL = 0.10
+
+    def _build_fit_feeder(self, parent):
+        """The Fiber diameter (filament) type: mm of filament per minute per
+        unit of the feeder command, from the feeder plate's lines
+        (Q = (pi/4) d^2 v = the filament's area times its speed). The plate's
+        optional slide 2, at twice the rate, checks the gear does not slip.
+        Apply writes `feed_rate_measured` and ticks its "Use a measured
+        value". The feed test needs no print, so it is on Setup's Material
+        delivery card (`_apply_feed_test`), not here."""
+        F = gui_form.Form(parent)
+        self._fit_feed_n = tk.StringVar()
+        self._fit_feed_v = tk.StringVar()
+        F.entry("Feeder rate", self._fit_feed_n,
+                "The Feeder rate slide 1 was printed at. Seeded from this "
+                "type's print design.")
+        F.entry("Print speed", self._fit_feed_v,
+                "The speed the lines were printed at. Seeded from this type's "
+                "print feed.", unit="mm/s")
+        self._fit_feed_diams, self._fit_feed_diam_widgets = self._fit_rep_cells(
+            F, "Slide 1 fiber Ø",
+            "One cell per line on slide 1. Blank cells are skipped, so "
+            "measuring three of five lines gives a three-line mean.",
+            unit="mm")
+        rows = []
+        self._fit_feed_slip_diams, self._fit_feed_slip_widgets = \
+            self._fit_rep_cells(
+                F, "Slide 2 fiber Ø",
+                "One cell per line on slide 2, printed at twice the Feeder "
+                "rate. Optional: it checks the feeder gear does not slip.",
+                unit="mm", row_out=rows)
+        self._fit_feed_slip_row = rows[0] if rows else None
+        self._fit_feed_out = self._fit_result_row(
+            F, self._compute_fit_feeder, self._apply_fit_feeder)
+        self._cal_sync_diam_fit()
+
+    def _feed_per_unit(self, d, v, n):
+        """mm/min of filament per unit of Feeder rate `n`, from a fiber of
+        diameter `d` (mm) laid at `v` (mm/s): mass conservation."""
+        area = self._calibration_model().filament_area()
+        return 0.25 * math.pi * d * d * v / area * 60.0 / n
+
+    def _compute_fit_feeder(self):
+        slip = ""
+        try:
+            n = self._fit_float(self._fit_feed_n)
+            if not n > 0.0:
+                raise ValueError("the Feeder rate must be above 0")
+            d = self._fit_mean_diam(self._fit_feed_diams)
+            if d is None:
+                raise ValueError("type at least one slide 1 diameter")
+            v = self._fit_float(self._fit_feed_v)
+            if not v > 0.0:
+                raise ValueError("the print speed must be above 0")
+            val = self._feed_per_unit(d, v, n)
+            k = self._fit_rep_filled(self._fit_feed_diams)
+            how = "slide 1, %d line%s" % (k, "" if k == 1 else "s")
+            d2 = self._fit_mean_diam(self._fit_feed_slip_diams)
+            if d2 is not None:
+                val2 = self._feed_per_unit(d2, v, 2.0 * n)
+                off = (val2 - val) / val
+                pct = round(abs(off) * 100.0)
+                slip = (" Slide 2 gives %.5g, %s." % (
+                    val2, "the same" if pct == 0 else "%d%% %s" % (
+                        pct, "lower" if off < 0 else "higher")))
+                if off < -self._FEED_SLIP_TOL:
+                    slip += (" The feeder may be slipping at twice the "
+                             "rate: keep scaffolds near the rate you "
+                             "calibrated at.")
+                elif abs(off) <= self._FEED_SLIP_TOL:
+                    slip += " The feeder does not slip."
+        except (ValueError, ZeroDivisionError) as exc:
+            self._fit_results.pop("feeder", None)
+            self._fit_feed_out.configure(
+                text=self._fit_say(exc, "Check the Feeder rate, the speed and "
+                                        "the diameters."),
+                foreground="#a33")
+            return
+        self._fit_results["feeder"] = val
+        self._fit_feed_out.configure(
+            text="Feed per unit = %.5g mm/min of filament (from %s).%s"
+                 % (val, how, slip), foreground="#1f6b2e")
+
+    def _apply_fit_feeder(self):
+        self._compute_fit_feeder()
+        if "feeder" not in self._fit_results:
+            return
+        key = mew_calibration.KEY_PREFIX + "feed_rate_measured"
+        fs = mew_calibration._BY_KEY.get(key)
+        gate = self.cal_vars.get(fs.gate_key) if fs is not None else None
+        if gate is not None:
+            gate.set(True)
+        self._cal_apply(key, self._fit_results["feeder"],
+                        name="Feed per unit (measured)")
+        self._sync_cal_gates()
+        # the feeder is the printer's: it is kept with the printer preset,
+        # which Apply does not save by itself
+        self.status.set(
+            "Applied ‘Feed per unit (measured)’ on Setup › Printer & "
+            "collector › Material delivery. Save your printer preset there to keep it "
+            "for the next start.")
+
     def _build_fit_fusion(self, parent):
         """Junction and wall heights measured on the scaffold the operator printed.
 
@@ -2187,6 +3001,7 @@ class _CalibrationMixin:
         "lag4": "_build_fit_mandrel_lag",
         "sag": "_build_fit_sag",
         "fusion": "_build_fit_fusion",
+        "feeder": "_build_fit_feeder",
     }
 
     #: True where the ribbon carries Apply (`gui_gcode_calibrate`): the fit
@@ -2315,6 +3130,10 @@ class _CalibrationMixin:
             "about a print you already made. Each section's dot names its "
             "Instructions step. Readings go in Measurements."))
         settings.body.columnconfigure(0, weight=1)
+        # one label column for the type's own fields and Plate & feed limit
+        # below them (gui_form._CardLabels); without it each section sized
+        # its own and the two columns of fields did not line up
+        settings.body._form_card = True
         per_tab = {"settings": ttk.Frame(settings.body)}
         per_tab["settings"].grid(row=0, column=0, sticky="ew")
         per_tab["settings"].columnconfigure(0, weight=1)
@@ -2593,6 +3412,15 @@ class _CalibrationMixin:
                 g("visc_temp"),
                 gui_units.show("speed", g("visc_speed"), "mm/min"),
                 g("visc_reps"))
+        elif protocol == "feed":
+            try:
+                rate = "%g" % self._sw_feed_rate()
+            except (ValueError, tk.TclError, KeyError, AttributeError):
+                rate = "?"
+            text = "Feeder rate %s%s at %s · %s lines" % (
+                rate, " and ×2" if v["feed_slip"].get() else "",
+                gui_units.show("speed", g("feed_speed"), "mm/min"),
+                g("feed_reps"))
         elif protocol == "sag":
             spans = g("sag_spans").split()
             span_txt = ("%s → %s mm" % (spans[0], spans[-1]) if len(spans) > 1
@@ -2616,7 +3444,7 @@ class _CalibrationMixin:
         res = getattr(self, "_sw_result", None)
         # the result must be THIS design's, not the last tab's still standing
         # while the rebuild is debounced (the viscosity plate runs "diam")
-        engine_kind = {"visc": "diam"}.get(protocol, protocol)
+        engine_kind = {"visc": "diam", "feed": "diam"}.get(protocol, protocol)
         # a mandrel print is one print, never a slide
         if res is not None and v["kind"].get() == protocol \
                 and res.kind == engine_kind:
@@ -2632,6 +3460,7 @@ class _CalibrationMixin:
     #: protocol token -> what to call that print in a sentence.
     _PROTOCOL_NAMES = {"diam": "the melt temperature ladder",
                        "visc": "the viscosity plate",
+                       "feed": "the feeder plate",
                        "cts": "the CTS speed ladder",
                        "cts4": "the CTS speed ladder on the mandrel",
                        "circle": "the lag circles",
@@ -2859,7 +3688,29 @@ class _CalibrationMixin:
         # "step 11" means the eleventh.
         _fr, IF = gui_form.framed(parts["instructions"], 0)
         IF.section(proc.title)
+        # a type's lead link, the first line under its title
+        # (`calibration_procedures.LEAD_LINKS`)
+        try:
+            import calibration_procedures as cp
+            lead = getattr(cp, "LEAD_LINKS", {}).get(key)
+        except ImportError:
+            lead = None
+        if lead:
+            text, where = lead
+            go = {"delivery": lambda: self._goto_delivery("feed_test")}.get(
+                where)
+            if go is not None:
+                IF.slot(None, ttk.Button(IF.frame, text=text,
+                                         style="LinkBold.TButton",
+                                         cursor="hand2", command=go))
         IF.intro(proc.calibrates, wrap=self._INSTR_WRAP)
+        # what this value does not do under the printer's material delivery
+        # (`calibration_procedures.DELIVERY_NOTES`), kept current by
+        # `_refresh_cal_delivery_notes`
+        note = tk.StringVar(value="")
+        self.__dict__.setdefault("_cal_delivery_notes", {})[key] = note
+        IF.live(None, textvariable=note, wrap=self._INSTR_WRAP, warn=True)
+        self._refresh_cal_delivery_notes()
         steps = ttk.Frame(IF.frame)
         IF.slot(None, steps, sticky="ew")
         gui_form.exempt(steps, "the operator procedure: numbered prose the "

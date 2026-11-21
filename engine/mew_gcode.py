@@ -248,6 +248,23 @@ def wait_temp_line(temperature, flavor="klipper"):
     return tmpl.replace("{t}", f"{t:g}") + "\n"
 
 
+def set_temp_line(temperature, flavor="klipper"):
+    """The flavor's Set temperature command (`heat_set`, no wait) at
+    `temperature` degC, with no newline, or "" when the row is blank or the
+    temperature is not a positive number."""
+    try:
+        t = float(temperature)
+    except (TypeError, ValueError):
+        return ""
+    if not (math.isfinite(t) and t > 0.0):
+        return ""
+    tmpl = get_flavor(flavor).heat_set
+    if not tmpl:
+        return ""
+    v = f"{t:g}"
+    return tmpl.replace("{value}", v).replace("{t}", v)
+
+
 #: a NOZZLE heater set: M104/M109 (Marlin, Klipper, RepRap) or Klipper's
 #: SET_HEATER_TEMPERATURE on the extruder. Matched after the comment is cut.
 _NOZZLE_SET = re.compile(r"^\s*(?:N\d+\s+)?(M104|M109)\b(.*)$", re.I)
@@ -343,6 +360,13 @@ class OutputOptions:
                    other viewers. A `Document` writes them; the plain-text
                    `apply_output_options` has no map and writes none.
 
+    extrude        the filament feed "Per line (E)" (`write_extrusion`):
+                   ``{"ratios": [mm of filament per mm of fiber, one per
+                   scaffold], "radius": mm (a mandrel's, for the length a
+                   rotary move lays; 0 on a plate), "starts": [[line,
+                   scaffold], ...] (where each scaffold begins in the base
+                   text, from the generator's line map)}``, or None.
+
     The caller decides what applies: an imported file passes all-off, which
     is today's invariant that an imported file is never rewritten."""
     travel_as_g1: bool = False
@@ -359,10 +383,12 @@ class OutputOptions:
     end_block: str = ""
     context: dict = field(default_factory=dict)
     rig_recipes: list = field(default_factory=list)
+    extrude: object = None
 
     def active(self, flavor="klipper"):
         """True when the export form differs from the base text."""
         return bool(self.travel_as_g1 or self.padded or self.drop_layer_z
+                    or _extrude_on(self.extrude, flavor)
                     or wait_temp_line(self.wait_temp, flavor)
                     or self.custom_line is not None
                     or self.incremental or self.start_block or self.end_block
@@ -383,7 +409,9 @@ class OutputOptions:
                 "rotary_axes": str(self.rotary_axes or ""),
                 "layer_markers": bool(self.layer_markers),
                 "start_block": self.start_block, "end_block": self.end_block,
-                "context": dict(self.context), "rig_recipes": list(self.rig_recipes)}
+                "context": dict(self.context), "rig_recipes": list(self.rig_recipes),
+                "extrude": (None if self.extrude is None
+                            else dict(self.extrude))}
 
     @classmethod
     def from_dict(cls, d):
@@ -404,7 +432,9 @@ class OutputOptions:
                    start_block=str(d.get("start_block", "") or ""),
                    end_block=str(d.get("end_block", "") or ""),
                    context=dict(d.get("context", {}) or {}),
-                   rig_recipes=list(d.get("rig_recipes", ()) or ()))
+                   rig_recipes=list(d.get("rig_recipes", ()) or ()),
+                   extrude=(dict(d["extrude"]) if d.get("extrude")
+                            else None))
 
 
 def apply_output_options(text, opts, flavor="klipper"):
@@ -419,7 +449,24 @@ def apply_output_options(text, opts, flavor="klipper"):
         raise ValueError("AUTO boundaries need a line map: use Document")
     if opts.rig_recipes:
         return Document(text, LineMap.guess_from_z(text), flavor, opts).export_text()
-    if opts.travel_as_g1 or opts.padded or opts.drop_layer_z:
+    if _extrude_on(opts.extrude, flavor):
+        # The spelling rewrite FIRST, as the Document does (`_apply_options`
+        # before `_extrude_rlines`), so E measures the move the printer
+        # makes: a layer Z that "Don't adjust height per layer" dropped lays
+        # nothing. Each line keeps the scaffold its ORIGINAL number had in
+        # the generator's line map, so a deleted line shifts nothing.
+        lines = text.splitlines(keepends=True)
+        groups = _extrude_groups(len(lines), opts.extrude)
+        if opts.travel_as_g1 or opts.padded or opts.drop_layer_z:
+            new = _rewrite_line_list(lines, opts.travel_as_g1, opts.padded,
+                                     opts.drop_layer_z, opts.boundaries,
+                                     five_axis=is_five_axis_gcode(text))
+            kept = [(ln, g) for ln, g in zip(new, groups) if ln is not None]
+            lines, groups = [k[0] for k in kept], [k[1] for k in kept]
+        text = "".join(write_extrusion(lines, opts.extrude, flavor,
+                                       groups=groups,
+                                       incremental=opts.incremental))
+    elif opts.travel_as_g1 or opts.padded or opts.drop_layer_z:
         text = rewrite_gcode_lines(text, opts.travel_as_g1, opts.padded,
                                    drop_layer_z=opts.drop_layer_z,
                                    boundaries=opts.boundaries)
@@ -474,12 +521,33 @@ class Flavor:
     dwell_word / dwell_unit   the G4 parameter and its unit, "ms" or "s"
                               ("" = unknown: no dwell form).
     heat_wait                 template with {t} (degC), "" when none.
+    heat_set                  set the temperature and carry on, no wait:
+                              template with {value} (degC). Empty for
+                              every built-in, so a lab opts in (M104 S{value}
+                              on Marlin, Klipper, RepRapFirmware).
     message                   template with {msg}, "" when none.
     pause                     the operator-pause line, "" when none.
     pressure / hv_on / hv_off / hv_level
                               MEW process commands. Empty for every built-in:
                               no firmware source defines them. Custom fills
                               them.
+    feed                      a filament feeder's speed command, template
+                              with {value} (Setup › Material delivery's
+                              Feeder rate), e.g. a MEWron's ``OCTO1 {value}``.
+                              Empty for every built-in: it is a lab's own
+                              command (an OctoPrint system command on the
+                              MEWron), not the firmware's.
+    extrude_word              the word that carries extrusion when the feed
+                              is "Per line (E)" (G-code's E). Empty: the
+                              controller has none (Aerotech, where E is the
+                              rotary rate), and that feed is not offered.
+    e_rule                    how the controller reads that word, absolute
+                              or relative: "marlin" (the last of G90 / G91 /
+                              M82 / M83 wins), "klipper" (relative when G91
+                              OR M83 is in force) or "duet" (only M82 / M83
+                              count). Empty: no extrusion.
+    abs_e_word                the absolute-extrusion command (M82) MEWracle
+                              writes before the first E.
     comment                   the comment lead character.
     max_line                  maximum characters per line, 0 = no limit.
     line_numbers              write N<k> words.
@@ -505,12 +573,17 @@ class Flavor:
     dwell_word: str = "P"
     dwell_unit: str = "ms"
     heat_wait: str = ""
+    heat_set: str = ""
     message: str = ""
     pause: str = ""
     pressure: str = ""
     hv_on: str = ""
     hv_off: str = ""
     hv_level: str = ""
+    feed: str = ""
+    extrude_word: str = "E"
+    e_rule: str = ""
+    abs_e_word: str = "M82"
     comment: str = ";"
     max_line: int = 0
     line_numbers: bool = False
@@ -1562,6 +1635,7 @@ PLACEHOLDERS = (
                       "(mandrel)"),
     ("scaffold_length", "scaffold length along the mandrel, mm (mandrel)"),
     ("scaffold_count", "number of scaffolds"), ("pressure", "pressure, psi"),
+    ("feed", "filament feed: the feeder's setting, or Per line (E)"),
     ("voltage", "voltage, kV"), ("temperature", "temperature, °C"),
     ("gap", "nozzle-to-collector gap, mm"),
     ("nozzle_height", "nozzle height above the collector, mm (the same "
@@ -1573,6 +1647,7 @@ PLACEHOLDERS = (
     ("t_ref", "reference temperature for the viscosity, °C"),
     ("notes", "print notes"), ("version", "MEWracle build"),
     ("pressure_command", "flavor's pressure setpoint"),
+    ("feed_command", "flavor's filament-feed command"),
     ("voltage_command", "flavor's voltage setpoint"),
     ("temperature_command", "flavor's temperature setpoint"),
 )
@@ -1585,7 +1660,8 @@ RULE_ONLY_PLACEHOLDERS = frozenset(
 #: (Klipper's built-in profile has none); every other placeholder keeps its
 #: line even when its value is blank.
 OPTIONAL_PLACEHOLDERS = frozenset(
-    ("pressure_command", "voltage_command", "temperature_command"))
+    ("pressure_command", "feed_command", "voltage_command",
+     "temperature_command"))
 BLOCK_PLACEHOLDERS = tuple(
     (k, d) for k, d in PLACEHOLDERS if k not in RULE_ONLY_PLACEHOLDERS)
 RULE_PLACEHOLDERS = tuple(
@@ -1606,11 +1682,13 @@ DEFAULT_START_BLOCK = "\n".join((
     "; Winding angle (deg from the mandrel axis): [[winding_angle]]",
     "; Scaffold length (mm): [[scaffold_length]]",
     "; Layers: [[layers]]",
-    "; Pressure (psi): [[pressure]]", "; Voltage (kV): [[voltage]]",
+    "; Pressure (psi): [[pressure]]", "; Feeder rate: [[feed]]",
+    "; Voltage (kV): [[voltage]]",
     "; Temperature (C): [[temperature]]", "; Gap (mm): [[gap]]",
     "; Speed (mm/min): [[speed]]", "; Nozzle: [[nozzle]]",
     "; Polymer: [[polymer]]", "; MEWracle: [[version]]",
-    "; Notes: [[notes]]", "[[pressure_command]]", "[[voltage_command]]",
+    "; Notes: [[notes]]", "[[pressure_command]]", "[[feed_command]]",
+    "[[voltage_command]]",
     "[[temperature_command]]"))
 
 
@@ -2932,6 +3010,8 @@ class Document:
         if form == "parse" and fl.aliases:
             out = [RLine(read_line(o.text, fl), o.origin, o.chip, o.key,
                          o.readonly, o.uid) for o in out]
+        if form == "export" and _extrude_on(self.options.extrude, fl):
+            out = _extrude_rlines(out, fl, self.options, ending)
         if form == "export":
             out = machine_render(out, fl, self.options, ending)
         elif form == "parse" and fl.rotary_feed == "split" and \
@@ -4914,20 +4994,23 @@ def machine_placeholder_context(context, flavor="klipper"):
            for k, v in (context or {}).items()}
     ctx.setdefault("nozzle_height", ctx.get("gap", ""))
     for name, template, key in (("pressure_command", fl.pressure, "pressure"),
+                                ("feed_command", fl.feed, "feed"),
                                 ("voltage_command", fl.hv_level, "voltage")):
         try:
             value = fmt_num(float(ctx.get(key, "")))
         except (ValueError, TypeError):
             value = ""
         ctx[name] = template.replace("{value}", value) if template and value else ""
-    # The heat wait is ONE control, the printer's "Wait to print until target
-    # temperature is reached" box, on every flavor: ticked (`heat_wait` in
-    # the print values) writes the flavor's wait, unticked writes none. So
-    # a MEWron still starts without a wait unless the box asks for one.
-    ctx["temperature_command"] = (
-        wait_temp_line(ctx.get("temperature"), fl).strip()
-        if ctx.get("heat_wait", "").strip().lower() in ("1", "true", "yes")
-        else "")
+    # [[temperature_command]] follows the printer's "Wait to print until
+    # target temperature is reached" box, on every flavor: ticked (`heat_wait`
+    # in the print values) writes the flavor's Heat and wait, unticked writes
+    # its Set temperature. A blank row writes nothing, and Set temperature is
+    # blank on every shipped flavor, so an unticked box still writes no line.
+    if ctx.get("heat_wait", "").strip().lower() in ("1", "true", "yes"):
+        ctx["temperature_command"] = wait_temp_line(
+            ctx.get("temperature"), fl).strip()
+    else:
+        ctx["temperature_command"] = set_temp_line(ctx.get("temperature"), fl)
     return ctx
 
 
@@ -4946,41 +5029,73 @@ def _template_word(template):
     return ""
 
 
-def process_setpoints(text, flavor="klipper"):
+def process_setpoints(text, flavor="klipper", feed_mode="pressure"):
     """What the file `text` does about the three process settings a MEW
     print needs, read off its command lines (comments are skipped):
-    ``{name: {"written": bool, "word": str}}`` for "voltage", "pressure"
-    and "temperature", plus "hv_off". `word` is the command the flavor
-    writes for it ("" = this flavor has none, which is every built-in for
-    voltage and pressure: no firmware source defines them).
+    ``{name: {"written": bool, "word": str, "label": str, "tag": str}}``
+    for "voltage", "pressure" and "temperature", plus "hv_off". `word` is
+    the command the flavor writes for it ("" = this flavor has none, which
+    is every built-in for voltage, pressure and feed: no firmware source
+    defines them). `label` is the setting in words, `tag` its start-block
+    placeholder.
+
+    The "pressure" entry is the MELT FEED, whatever drives it
+    (`feed_mode`, Setup's Material delivery card): air pressure, a feeder's
+    speed command (label "feed", the flavor's `feed`), or Per line (E),
+    which the moves themselves carry (written when any carries the
+    flavor's extrusion word).
 
     Read off the TEXT, not the settings, so a command a researcher put in
     by hand (an Insert, their own start block line) counts too."""
     fl = get_flavor(flavor)
+    melt = fl.feed if feed_mode == "speed" else fl.pressure
     words = {"voltage": [_template_word(fl.hv_level),
                          _template_word(fl.hv_on)],
-             "pressure": [_template_word(fl.pressure)],
-             "temperature": [_template_word(fl.heat_wait)],
+             "pressure": [_template_word(melt)],
+             "temperature": [_template_word(fl.heat_wait),
+                             _template_word(fl.heat_set)],
              "hv_off": [_template_word(fl.hv_off)]}
     firsts = set()
-    heat = False
+    heat = extruded = False
+    xw = (fl.extrude_word or "").upper()
     for raw in str(text or "").splitlines():
         body = strip_comment(raw, fl.comment).strip()
         if not body:
             continue
         body = re.sub(r"^[Nn]\d+\s+", "", body)
-        first = body.split()[0].upper()
+        toks = body.split()
+        first = toks[0].upper()
         firsts.add(first)
         if _ANY_HEAT.match(body):
             heat = True
+        if feed_mode == "e" and xw and not extruded and any(
+                _is_extrude_word(t, xw) for t in toks[1:]):
+            extruded = True
     out = {}
     for name, ws in words.items():
         ws = [w for w in ws if w]
         written = any(w in firsts for w in ws)
         if name == "temperature":
             written = written or heat
-        out[name] = {"written": written, "word": ws[0] if ws else ""}
+        label, tag = name, "%s_command" % name
+        if name == "pressure" and feed_mode in ("speed", "e"):
+            label, tag = "feed", "feed_command"
+            if feed_mode == "e":
+                written, ws = extruded, ([xw] if xw else [])
+        out[name] = {"written": written, "word": ws[0] if ws else "",
+                     "label": label, "tag": tag}
     return out
+
+
+def _is_extrude_word(tok, word):
+    """True when `tok` is the extrusion word `word` with a number (E0.5)."""
+    if not tok.upper().startswith(word):
+        return False
+    try:
+        float(tok[len(word):])
+    except ValueError:
+        return False
+    return True
 
 
 def _join_and(items, last="and"):
@@ -5000,7 +5115,11 @@ def process_gap_text(setpoints, flavor="klipper", where="Setup's G-code card"):
                if not setpoints.get(n, {}).get("written")]
     if not missing:
         return ""
-    out = ["This file does not set the %s." % _join_and(missing, "or")]
+
+    def lab(n):
+        return setpoints.get(n, {}).get("label", n)
+    out = ["This file does not set the %s."
+           % _join_and([lab(n) for n in missing], "or")]
     no_word = [n for n in missing if n != "temperature"
                and not setpoints[n]["word"]]
     has_word = [n for n in missing if n != "temperature"
@@ -5009,15 +5128,17 @@ def process_gap_text(setpoints, flavor="klipper", where="Setup's G-code card"):
         out.append(
             "%s has no %s command. Set %s on the printer before you start, "
             "or add your printer's own command%s under Edit flavors… (on %s)."
-            % (fl.label, _join_and(no_word, "or"),
+            % (fl.label, _join_and([lab(n) for n in no_word], "or"),
                "it" if len(no_word) == 1 else "them",
                "" if len(no_word) == 1 else "s", where))
     if has_word:
-        tags = ["[[%s_command]]" % n for n in has_word]
+        tags = ["[[%s]]" % setpoints[n].get("tag", n + "_command")
+                for n in has_word]
         one = len(has_word) == 1
         out.append("%s has a %s command%s, but the start block does not use "
                    "%s: add %s to the start block on %s."
-                   % (fl.label, _join_and(has_word), "" if one else "s",
+                   % (fl.label, _join_and([lab(n) for n in has_word]),
+                      "" if one else "s",
                       "it" if one else "them", _join_and(tags), where))
     if "temperature" in missing:
         if fl.heat_wait:
@@ -5781,8 +5902,11 @@ INSERT_FORMS = (
     ("dwell", "Dwell", (("seconds", "Time", "s", 2.0),)),
     ("wait_temp", "Wait for temperature",
      (("celsius", "Temperature", "°C", 90.0),)),
+    ("set_temp", "Set temperature",
+     (("celsius", "Temperature", "°C", 90.0),)),
     ("set_speed", "Set speed", (("mm_s", "Speed", "mm/s", 10.0),)),
     ("set_pressure", "Set pressure", (("value", "Pressure", "", 0.0),)),
+    ("set_feed", "Set feed", (("value", "Feeder rate", "", 0.0),)),
     ("hv_on", "High voltage on", (("value", "Voltage", "kV", 0.0),)),
     ("hv_off", "High voltage off", ()),
     ("hv_level", "Set high voltage", (("value", "Voltage", "kV", 0.0),)),
@@ -5847,16 +5971,29 @@ def make_command(kind, flavor="klipper", **fields):
                 "%s has no wait-for-temperature command." % fl.label
                 if not fl.heat_wait else "The temperature must be above 0.")
         return [line.rstrip("\n")]
+    if kind == "set_temp":
+        if not fl.heat_set:
+            raise CommandUnavailable(
+                "%s has no set-temperature command. Set yours in your own "
+                "flavor." % fl.label)
+        t = num("celsius")
+        if not t > 0.0:
+            raise CommandUnavailable("The temperature must be above 0.")
+        # {value} like every other process row; {t} as Heat and wait has it
+        return [fl.heat_set.replace("{value}", fmt_num(t))
+                .replace("{t}", fmt_num(t))]
     if kind == "set_speed":
         mm_s = num("mm_s")
         if mm_s <= 0:
             raise CommandUnavailable("The speed must be above 0.")
         return ["G1 F%s" % fmt_num(mm_s * 60.0)]
-    if kind in ("set_pressure", "hv_on", "hv_off", "hv_level"):
-        tmpl = {"set_pressure": fl.pressure, "hv_on": fl.hv_on,
+    if kind in ("set_pressure", "set_feed", "hv_on", "hv_off", "hv_level"):
+        tmpl = {"set_pressure": fl.pressure, "set_feed": fl.feed,
+                "hv_on": fl.hv_on,
                 "hv_off": fl.hv_off, "hv_level": fl.hv_level}[kind]
         if not tmpl:
-            what = {"set_pressure": "pressure", "hv_on": "high-voltage-on",
+            what = {"set_pressure": "pressure", "set_feed": "filament-feed",
+                    "hv_on": "high-voltage-on",
                     "hv_off": "high-voltage-off",
                     "hv_level": "high-voltage level"}[kind]
             raise CommandUnavailable(
@@ -6564,7 +6701,10 @@ def new_document(base_text="", line_map=None, flavor="klipper", options=None,
 FLAVORS["klipper"] = Flavor(
     "klipper", "Klipper", dwell_word="P", dwell_unit="ms",
     heat_wait="M109 S{t}", message="M117 {msg}", pause="PAUSE",
+    e_rule="klipper",
     sources={"dwell": "klipper3d.org/G-Codes.html (G4 P<ms>)",
+             "e_rule": "klippy/extras/gcode_move.py: G91 and M83 each make "
+                       "E relative (absolute_coord, absolute_extrude)",
              "heat_wait": "klipper3d.org/G-Codes.html (M109 [T] S)",
              "message": "klipper3d.org/G-Codes.html (M117, display_status)",
              "pause": "klipper3d.org/G-Codes.html (PAUSE needs "
@@ -6574,8 +6714,10 @@ FLAVORS["klipper"] = Flavor(
 FLAVORS["duet"] = Flavor(
     "duet", "RepRapFirmware (Duet)", dwell_word="S", dwell_unit="s",
     heat_wait="M109 S{t}", message="M117 {msg}", pause="M226",
-    max_line=255, multi_per_line=True,
+    max_line=255, multi_per_line=True, e_rule="duet",
     sources={"dwell": "RepRapFirmware GCodes.cpp DoDwell (G4 S s, P ms)",
+             "e_rule": "docs.duet3d.com G90/G91: they do not change the "
+                       "extruders; M82/M83 do",
              "heat_wait": "RepRapFirmware GCodes2.cpp (M109 deprecated but "
                           "handled)",
              "message": "RepRapFirmware GCodes2.cpp (M117 rest of line)",
@@ -6585,14 +6727,17 @@ FLAVORS["duet"] = Flavor(
 FLAVORS["marlin"] = Flavor(
     "marlin", "Marlin", dwell_word="P", dwell_unit="ms",
     heat_wait="M109 S{t}", message="M117 {msg}", pause="M0",
+    e_rule="marlin",
     sources={"dwell": "marlinfw.org/docs/gcode/G004.html",
+             "e_rule": "marlinfw.org/docs/gcode/G090.html, G091.html, "
+                       "M082.html, M083.html: the last one sent wins",
              "heat_wait": "marlinfw.org/docs/gcode/M109.html (waits)",
              "message": "marlinfw.org/docs/gcode/M117.html (needs an LCD)",
              "pause": "marlinfw.org/docs/gcode/M000-M001.html (ignored "
                       "without an LCD or EMERGENCY_PARSER)"})
 FLAVORS["grbl"] = Flavor(
     "grbl", "GRBL", dwell_word="P", dwell_unit="s", heat_wait="",
-    message="", pause="M0",
+    message="", pause="M0", extrude_word="", abs_e_word="",
     sources={"dwell": "gnea/grbl motion_control.c mc_dwell(float seconds)",
              "pause": "gnea/grbl gcode.c (M0)"})
 # Aerotech AeroBasic (A3200 class). Seeded from a lab's own working program
@@ -6609,7 +6754,8 @@ FLAVORS["aerotech"] = Flavor(
     move_word="LINEAR", rapid_word="", arc_cw="", arc_ccw="",
     abs_word="ABSOLUTE", inc_word="INCREMENTAL",
     home=("HOME Z", "HOME A", "HOME X Y"), units_word="",
-    rotary_feed="split", aliases=("RAPID=G0",),
+    rotary_feed="split", aliases=("RAPID=G0",), extrude_word="",
+    abs_e_word="",
     sources={"moves": "the lab's working A3200 program (LINEAR, INCREMENTAL, "
                       "HOME, DWELL); help.aerotech.com AeroScript Equivalents "
                       "of AeroBasic Commands (LINEAR, CW/CCW, DWELL, HOME are "
@@ -6624,6 +6770,18 @@ FLAVORS["aerotech"] = Flavor(
                             "linear axis runs at F, E governs a rotary-only "
                             "move"})
 
+
+# Every built-in starts with the MEWron's feeder command, so "Filament rate"
+# writes its Feeder rate out of the box (Setup › Material delivery). Source:
+# the MEWron's own feeder, a TMC2209 driven in VACTUAL mode from the Pi by
+# `OCTO1 N`. A lab with another feeder changes it under Edit flavors….
+for _fl in FLAVORS.values():
+    if not _fl.feed:
+        _fl.feed = "OCTO1 {value}"
+        _fl.sources = dict(_fl.sources or {}, feed=(
+            "the MEWron's filament feeder: OCTO1 N sets the TMC2209's VACTUAL "
+            "speed from the Pi"))
+del _fl
 
 #: The built-ins exactly as MEWracle ships them. A lab may edit a built-in
 #: (`flavor_presets` keeps the edit on its computer); this copy is what
@@ -6655,8 +6813,14 @@ def custom_flavor(base="klipper", name="custom", label="Custom", **changes):
             d[k] = _split_list(d[k])
     if d.get("rotary_feed") not in ("combined", "split"):
         d["rotary_feed"] = "combined"
+    if d.get("e_rule") not in E_RULES:
+        d["e_rule"] = ""
     d["sources"] = {}
     return Flavor.from_dict(d)
+
+
+#: How a controller reads its extrusion word (`Flavor.e_rule`); "" = none.
+E_RULES = ("", "marlin", "klipper", "duet")
 
 
 #: Built-in labels older builds showed and SAVED (presets, sessions). The lab's
@@ -6688,12 +6852,17 @@ FLAVOR_FIELDS = (
     ("dwell_word", "Dwell word", "P or S"),
     ("dwell_unit", "Dwell unit", "ms or s"),
     ("heat_wait", "Heat and wait", "M109 S{t}"),
+    ("heat_set", "Set temperature", "M104 S{value}"),
     ("message", "Message", "M117 {msg}"),
     ("pause", "Pause", "PAUSE"),
     ("pressure", "Set pressure", "M260.3 P2 S\"{value}\""),
     ("hv_on", "High voltage on", "SET_HV VALUE={value}"),
     ("hv_off", "High voltage off", "SET_HV VALUE=0"),
     ("hv_level", "Set high voltage", "SET_HV VALUE={value}"),
+    ("feed", "Set feed (filament feeder)", "OCTO1 {value}"),
+    ("extrude_word", "Extrusion word (E)", "E, or empty for none"),
+    ("e_rule", "Extrusion read as", "marlin, klipper or duet"),
+    ("abs_e_word", "Absolute extrusion (M82)", "M82"),
     ("comment", "Comment character", ";"),
     ("max_line", "Longest line (0 = no limit)", "255"),
     ("line_numbers", "Number the lines", "off"),
@@ -6736,8 +6905,14 @@ FLAVOR_GROUPS = (
      "What Insert writes for these. Empty means your machine has none and "
      "Insert greys it out. Your own commands can also be saved as scripts "
      "in My library.",
-     ("heat_wait", "message", "pause", "pressure", "hv_on", "hv_off",
-      "hv_level")),
+     ("heat_wait", "heat_set", "message", "pause", "pressure", "hv_on",
+      "hv_off", "hv_level")),
+    ("Filament feed",
+     "For a filament feeder in place of air pressure (Setup › Polymer "
+     "delivery). Set feed is the command a Filament rate feeder takes "
+     "once, with {value} for the Feeder rate. The extrusion rows say how "
+     "this controller reads E when the delivery is Per line (E).",
+     ("feed", "extrude_word", "e_rule", "abs_e_word")),
     ("File",
      "How a saved file is laid out.",
      ("comment", "max_line", "line_numbers")),
@@ -6754,6 +6929,18 @@ FLAVOR_TIPS = {
     "rotary_feed": "What F measures on a rotary move. combined: one F, the "
                    "speed along the surface. split: F is the linear rate "
                    "and E the rotary rate (Aerotech).",
+    "heat_set": "Sets the nozzle temperature and carries on without "
+                "waiting for it, with {value} for °C (M104 S{value} on "
+                "Marlin, Klipper and RepRapFirmware). Empty: Insert greys "
+                "out Set temperature. Heat and wait is the one that waits.",
+    "feed": "MEWracle writes this once at the start, through "
+            "[[feed_command]] in the start block, with the Feeder rate "
+            "for {value}. A MEWron takes OCTO1 {value}.",
+    "e_rule": "marlin: the last of G90, G91, M82 and M83 decides. "
+              "klipper: E is relative when G91 or M83 is in force. "
+              "duet: only M82 and M83 decide. MEWracle writes absolute E "
+              "after the absolute-extrusion command, and reads files you "
+              "open by this rule.",
     "known": "Commands your controller accepts that are not moves. They "
              "already go to the machine as written; listing one here only "
              "stops the G-code page asking whether it is a move.",
@@ -7028,9 +7215,9 @@ def flavor_words(flavor):
     home lines, its process commands, its aliases and its kept words."""
     fl = get_flavor(flavor)
     words = {w.upper() for w in spelling(fl).values() if w}
-    for t in (fl.heat_wait, fl.message, fl.pause, fl.pressure, fl.hv_on,
-              fl.hv_off, fl.hv_level) + tuple(fl.home) + tuple(fl.header) \
-            + tuple(fl.footer):
+    for t in (fl.heat_wait, fl.heat_set, fl.message, fl.pause, fl.pressure,
+              fl.feed, fl.hv_on, fl.hv_off, fl.hv_level, fl.abs_e_word) \
+            + tuple(fl.home) + tuple(fl.header) + tuple(fl.footer):
         toks = str(t or "").split()
         if toks:
             words.add(toks[0].upper())
@@ -7177,6 +7364,198 @@ def _origin_block(fl, opts, rlines):
     else:
         lines += ["G91", move]
     return lines
+
+
+# =========================================================================== #
+# 2d. Filament feed, "Per line (E)"
+# =========================================================================== #
+
+#: decimals of an E word: 1e-6 mm of 1.75 mm filament is 2.4 fL, far under
+#: anything a stepper meters, so the sum never drifts on a long print
+E_DECIMALS = 6
+
+
+def _extrude_on(ex, flavor):
+    """True when `ex` (`OutputOptions.extrude`) writes E in `flavor`."""
+    if not ex or not any(float(r or 0.0) > 0.0 for r in ex.get("ratios", ())):
+        return False
+    fl = get_flavor(flavor)
+    return bool(fl.extrude_word and fl.e_rule)
+
+
+def _move_length(c, before, after, words, radius):
+    """mm of fiber one internal G-code move lays: the straight (or arc) path
+    in X, Y, Z, plus a rotary turn as the arc it lays on a mandrel of
+    `radius` (0: a rotary turn lays nothing)."""
+    dx = after.get("X", 0.0) - before.get("X", 0.0)
+    dy = after.get("Y", 0.0) - before.get("Y", 0.0)
+    dz = after.get("Z", 0.0) - before.get("Z", 0.0)
+    rot = 0.0
+    if radius > 0.0:
+        for L in ROTARY_WORDS:
+            if L in after or L in before:
+                rot += (math.radians(after.get(L, 0.0) - before.get(L, 0.0))
+                        * radius) ** 2
+    if c in ("G2", "G3") and ("I" in words or "J" in words):
+        try:
+            cx = before.get("X", 0.0) + float(words.get("I", 0.0))
+            cy = before.get("Y", 0.0) + float(words.get("J", 0.0))
+        except ValueError:
+            cx = cy = None
+        if cx is not None:
+            r = math.hypot(before.get("X", 0.0) - cx, before.get("Y", 0.0) - cy)
+            a0 = math.atan2(before.get("Y", 0.0) - cy, before.get("X", 0.0) - cx)
+            a1 = math.atan2(after.get("Y", 0.0) - cy, after.get("X", 0.0) - cx)
+            sweep = a1 - a0
+            if c == "G2":
+                sweep = -sweep
+            sweep %= 2.0 * math.pi
+            if sweep < 1e-12:
+                sweep = 2.0 * math.pi       # a full circle ends where it began
+            return math.sqrt((r * sweep) ** 2 + dz * dz + rot)
+    return math.sqrt(dx * dx + dy * dy + dz * dz + rot)
+
+
+def _extrude_groups(n_lines, ex):
+    """The scaffold of each of `n_lines` generator lines, read off
+    `ex["starts"]` (the line map's group marks), scaffold 0 before the
+    first. A map made for another text would put each scaffold's ratio on
+    the wrong lines, so with a line count that differs every line takes
+    scaffold 1's."""
+    n = ex.get("n_lines")
+    at = ({int(a): int(g) for a, g in ex.get("starts", ())}
+          if n is None or int(n) == n_lines else {})
+    groups, g = [], 0
+    for i in range(n_lines):
+        g = at.get(i, g)
+        groups.append(g)
+    return groups
+
+
+def write_extrusion(lines, ex, flavor, groups=None, incremental=False):
+    """`lines` (internal G-code, line endings kept) with the filament feed
+    written into every move: each G0 / G1 / G2 / G3 that goes anywhere
+    gains the flavor's extrusion word, its scaffold's ratio (`ex["ratios"]`,
+    mm of filament per mm of fiber, `MEWModel.e_per_mm_for`) times the
+    length the move lays (`_move_length`). A travel is fed like a printing
+    move: MEW flow is continuous, the jet lays fiber on a travel too, and a
+    feeder that stopped for it would starve the jet. So it does not matter
+    whether "Emit travel moves as G1" has already turned the G0s into G1s
+    (the Document path) or not yet (`apply_output_options`): both write the
+    same E.
+
+    `groups` is the scaffold of each line (None: read off `ex["starts"]`,
+    the line map's group marks, and scaffold 0 before the first).
+
+    Absolute E, six decimals, after the flavor's absolute-extrusion command
+    and ``G92 E0`` above the first printing move, which reads the same on
+    Marlin, Klipper and RepRapFirmware (`Flavor.e_rule`). An `incremental`
+    export moves in G91, which makes E relative on Marlin and Klipper and
+    not on RepRapFirmware: there each move carries its own amount, after
+    M83 on a "duet" rule.
+
+    An extrusion word already on a printing move is replaced, so a design
+    edited and written again is never fed twice."""
+    fl = get_flavor(flavor)
+    word = fl.extrude_word
+    ratios = [max(0.0, float(r or 0.0)) for r in ex.get("ratios", ())] or [0.0]
+    radius = max(0.0, float(ex.get("radius", 0.0) or 0.0))
+    if groups is None:
+        groups = _extrude_groups(len(lines), ex)
+    xw = word.upper()
+    out = []
+    pos, rel = {}, False
+    total = 0.0
+    started = False
+    for i, raw in enumerate(lines):
+        body = raw.rstrip("\r\n")
+        end = raw[len(body):]
+        cmd, words = parse_words(body, fl.comment)
+        c = canon_cmd(cmd) if cmd else ""
+        if c in ("G90", "G91"):
+            rel = c == "G91"
+        elif c == "G92":
+            for L, v in words.items():
+                if L in _POS_WORDS:
+                    try:
+                        pos[L] = float(v)
+                    except ValueError:
+                        pass
+        if c not in _MOTION:
+            out.append(raw)
+            continue
+        before = dict(pos)
+        for L, v in words.items():
+            if L in _POS_WORDS:
+                try:
+                    fv = float(v)
+                except ValueError:
+                    continue
+                pos[L] = before.get(L, 0.0) + fv if rel else fv
+        g = groups[i] if i < len(groups) else 0
+        ratio = ratios[g] if 0 <= g < len(ratios) else ratios[-1]
+        length = _move_length(c, before, pos, words, radius)
+        if not (length > 0.0 and ratio > 0.0):
+            out.append(raw)
+            continue
+        if not started:
+            started = True
+            nl = end or "\n"
+            if incremental:
+                if fl.e_rule == "duet":
+                    out.append("M83" + nl)
+            else:
+                if fl.abs_e_word:
+                    out.append(fl.abs_e_word + nl)
+                out.append("G92 %s0%s" % (word, nl))
+        amount = length * ratio
+        total += amount
+        code, sep, note = body.partition(fl.comment) if fl.comment else (
+            body, "", "")
+        toks = [t for t in code.split()
+                if not _is_extrude_word(t, xw)]
+        toks.append("%s%.*f" % (word, E_DECIMALS,
+                                amount if incremental else total))
+        new = " ".join(toks)
+        if sep:
+            new += " " + sep + note
+        out.append(new + end)
+    return out
+
+
+def _extrude_rlines(rlines, fl, opts, ending):
+    """`write_extrusion` over a document's rendered lines: each line's
+    scaffold is its key's (a generated line's), and a line a chip added
+    takes the scaffold of the generated line above it. A line that gained
+    an E keeps its identity; the two lines put above the first printing
+    move are the option's own."""
+    groups, g = [], 0
+    for rl in rlines:
+        k = rl.key
+        if len(k) >= 3 and k[1] == "body" and isinstance(k[2], int) \
+                and k[2] >= 0:
+            g = k[2]
+        groups.append(g)
+    texts = [rl.text for rl in rlines]
+    new = write_extrusion(texts, opts.extrude, fl, groups=groups,
+                          incremental=bool(opts.incremental and fl.inc_word))
+    out, j = [], 0
+    for t in new:
+        if j < len(texts) and t == texts[j]:
+            out.append(rlines[j])
+            j += 1
+        elif j < len(texts) and t.split()[:1] == texts[j].split()[:1] \
+                and parse_command(t, fl.comment) in ("G0", "G00", "G1",
+                                                     "G01", "G2",
+                                                     "G02", "G3", "G03"):
+            o = rlines[j]
+            out.append(RLine(t, o.origin, o.chip, o.key, o.readonly, o.uid))
+            j += 1
+        else:
+            out.append(RLine(t if t.endswith(("\n", "\r")) else t + ending,
+                             "option", "opt:extrude", (), True,
+                             ("opt", "extrude", len(out))))
+    return out
 
 
 def machine_render(rlines, flavor, opts=None, ending="\n"):

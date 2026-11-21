@@ -422,7 +422,8 @@ class _ScriptsMixin:
             if wait is not None and wait.get():
                 text += mew_gcode.wait_temp_line(ctx.get("temperature"), fl)
             return mew_gcode.process_gap_text(
-                mew_gcode.process_setpoints(text, fl), fl, where=where)
+                mew_gcode.process_setpoints(text, fl, self._feed_mode()),
+                fl, where=where)
         except Exception:                                 # noqa: BLE001
             return ""
 

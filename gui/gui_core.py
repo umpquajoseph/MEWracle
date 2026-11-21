@@ -158,6 +158,23 @@ class _CoreMixin:
         readout falls back to the model defaults."""
         return None
 
+    def _feed_mode(self):
+        """The melt feed: "pressure" here; `_CalibrationMixin` reads Setup's
+        Material delivery choice."""
+        return "pressure"
+
+    def _feed_e_per_mm(self, diameter=None):
+        """E mode's filament mm per fiber mm; None outside E mode (here always)."""
+        return None
+
+    def _extrude_options(self, use_gce=False, gcode_path=None):
+        """OutputOptions.extrude for Per line (E); None (no physics here)."""
+        return None
+
+    def _feed_read_args(self):
+        """The converter's --e-rule / --feed-spec for an opened file; none."""
+        return []
+
     def _sweeps_persist_entries(self):
         """No sweep-designer fields outside the modern shell (the Experiment
         sweeps page is gui_sweeps._SweepsMixin, modern UI only)."""

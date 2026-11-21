@@ -170,7 +170,9 @@ class _ShellMixin:
             proc = grid.add("process", "Process parameters", info=(
                 "What you set for this print: the nozzle–collector gap, "
                 "the applied voltage, "
-                "the melt pressure and the melt temperature.\n\n"
+                "how the polymer is fed (the pressure, or on a filament "
+                "printer the Feeder rate or fiber diameter, as Setup › "
+                "Material delivery says) and the melt temperature.\n\n"
                 "Print speed is set per scaffold under Parameters on the "
                 "Design page, because each scaffold in a stack can run at its "
                 "own speed."))

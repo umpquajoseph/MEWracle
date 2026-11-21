@@ -186,6 +186,15 @@ class PhysicsFigure(tk.Label):
         self._photo = ImageTk.PhotoImage(img, master=self)
         self.configure(image=self._photo)
 
+    def set_key(self, key):
+        """Show card picture `key` instead (the Process card's rig follows
+        Setup › Material delivery); a key with no picture on disk is ignored."""
+        if key == self.key or not available(key):
+            return
+        self.key = key
+        self._width = None
+        self._schedule()
+
     def retheme(self):
         pal = gui_widgets.palette()
         self.configure(bg=pal["bg"])

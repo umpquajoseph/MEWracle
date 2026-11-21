@@ -1334,7 +1334,7 @@ class _MachineLinkMixin:
             flavor = self._gcode_export_flavor()
         except AttributeError:
             flavor = "klipper"
-        sp = mew_gcode.process_setpoints(text, flavor)
+        sp = mew_gcode.process_setpoints(text, flavor, self._feed_mode())
         acc = getattr(self, "_preflight_accepted", None)
         accepted = acc() if callable(acc) else set()
         said = getattr(self, "_preflight_said", None) or set()
@@ -1343,7 +1343,8 @@ class _MachineLinkMixin:
         hv = ("This file does not set the %s: set %s on the printer before "
               "it starts (Setup's G-code card says how to add your "
               "printer's commands)."
-              % (" or ".join(vp), "it" if len(vp) == 1 else "them")
+              % (" or ".join(sp[n]["label"] for n in vp),
+                 "it" if len(vp) == 1 else "them")
               if vp else "")
         if _HEAT_CMD.search(text) or sp["temperature"]["written"] \
                 or "temperature" in accepted:
@@ -2102,9 +2103,11 @@ class _MachineLinkMixin:
              and hasattr(self, "_sw_rung_count") else 0)
         if path and os.path.isfile(path) and n:
             stem = os.path.splitext(self._ml_effective_upload_name())[0]
+            per = ("feeder rate" if self.sw_vars["kind"].get() == "feed"
+                   else "temperature")
             var.set("Will send:  %d files, %s_print1 to _print%d.gcode, one "
-                    "per temperature. None starts on its own."
-                    % (n, stem, n))
+                    "per %s. None starts on its own."
+                    % (n, stem, n, per))
         elif path and os.path.isfile(path):
             var.set("Will send:  %s" % self._ml_effective_upload_name())
         else:

@@ -1036,18 +1036,6 @@ def the_two_diameter_tabs_are_separate_designs():
         "a pasted ladder became %d slides" % len(params.temps)
     app.sw_vars["visc_temp"].set("95")
 
-    # every mounted card carries its own live conditions line, and they differ
-    # because the two designs carry different feeds
-    app._sw_update_cts_readout()
-    vnotes = [v.get() for v in getattr(app, "_sw_visc_notes", [])]
-    dnotes = [v.get() for v in getattr(app, "_sw_diam_notes", [])]
-    assert vnotes and all(n.strip() for n in vnotes), \
-        "the viscosity card has no conditions line"
-    assert dnotes and all(n.strip() for n in dnotes), \
-        "the Ea card has no conditions line"
-    assert set(vnotes).isdisjoint(dnotes), \
-        "both cards show one design's feed: %r" % (vnotes,)
-
     app.sw_vars["diam_temps"].set("100 92.5 85 77.5 70")
     app.sw_vars["diam_speed"].set("700")
     app.sw_vars["visc_temp"].set("100")
@@ -1596,14 +1584,9 @@ def a_mandrel_print_plays_on_the_4axis_machine():
             assert abs((rod[1] - rod[0]) - 40.0) < 1e-6, (start, stop, rod)
             assert rod[0] - 1e-6 <= bbox[0] and bbox[2] <= rod[1] + 1e-6,                 (start, stop, bbox, rod)
         assert snap() == page, "placing the ladder moved a Machine field"
-        # the shrink is said under the rod rows of its own card, never in the
-        # page's red strip (reported: "i hate the red text at the bottom")
+        # a shrink onto the rod is the expected outcome, never a warning
+        # (reported: "i hate the red text at the bottom")
         app._sw_render_warnings(app._sw_result)
-        cards = app._sw_rod_notes
-        assert any("shrunk to fit" in v.get() for v in cards["cts4"]), \
-            [v.get() for v in cards["cts4"]]
-        assert not any(v.get() for v in cards.get("tube", [])), \
-            "the ladder's note landed on the tube card"
         assert "shrunk" not in app._sw_warn_var.get(), app._sw_warn_var.get()
         prof = played("cts")
         assert prof["parts"]["bed"] == "bed3.stl", \

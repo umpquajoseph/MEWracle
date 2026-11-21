@@ -231,6 +231,13 @@ class DiamParams:
     base_speed: float | None = None  # mm/min; None = the print feed
     max_feed: float | None = None  # machine max translation feed, mm/min (warn)
     pressure_psi: float = 0.0      # annotation only (CSV); 0 = not recorded
+    # The FEEDER plate (a filament printer's Fiber diameter calibration): one
+    # slide per feeder rate, all at the one temperature `temps[0]`. None = the
+    # temperature ladder above. A rate is the flavor's feed-command value; like
+    # a temperature it is not in the engine's text, it is what the app's start
+    # block writes for that slide ([[feed_command]]), so each slide is its own
+    # file and the flow settles on the stabilization scaffold before the lines.
+    feed_rates: list | None = None
     # EXPORT options, the Scaffold designer's two that change the FILE. Both off
     # by default, which is byte-identical: `g2g3` writes the base pad's turnaround
     # loops (and a circle's lap) as true arcs; `exit_margin` (mm) appends the
@@ -1080,12 +1087,24 @@ def generate_diameter(p: DiamParams) -> SweepResult:
     column's capacity and the shortfall is NAMED in `oversize`, never dropped
     silently and never spilled onto a second slide -- a second slide would be a
     second rung, and the slide index IS the rung."""
-    _validate_plate(p, "temperature ladder")
+    feeder = p.feed_rates is not None
+    _validate_plate(p, "feeder plate" if feeder else "temperature ladder")
     if p.reps < 1:
         raise ValueError("lines per temperature must be >= 1")
     temps = temperature_ladder(p.temps)
     if not temps:
         raise ValueError("give at least one nozzle temperature (degC)")
+    if feeder:
+        # one temperature; the slides step the feeder rate instead, deduped
+        # in the order given (the first is the rate being calibrated)
+        rates = temperature_ladder(p.feed_rates)
+        if not rates:
+            raise ValueError("give at least one feeder rate")
+        if any(r <= 0 for r in rates):
+            raise ValueError("a feeder rate must be > 0")
+        rungs = [(temps[0], r) for r in rates]
+    else:
+        rungs = [(t, None) for t in temps]
     if p.speed <= 0:
         raise ValueError("print feed must be > 0")
     base_speed = p.base_speed if p.base_speed is not None else p.speed
@@ -1125,7 +1144,7 @@ def generate_diameter(p: DiamParams) -> SweepResult:
 
     texts, rows, metas = [], [], []
     all_specimens = []
-    for pi, temp in enumerate(temps, 1):
+    for pi, (temp, rate) in enumerate(rungs, 1):
         lines = ["G21", "G90"]
         labels, specimens = [], []
         base_bbox = None
@@ -1139,28 +1158,34 @@ def generate_diameter(p: DiamParams) -> SweepResult:
             ya = oy + y
             lines.append(f"G0 X{_fmt(xa)} Y{_fmt(ya)} Z0")
             lines.append(f"G1 X{_fmt(xb)} Y{_fmt(ya)} F{_fmt(p.speed)}")
-            label = f"d_{_fmt(temp)}C" + (f"_r{k + 1}" if laid > 1 else "")
+            stem = f"f{_fmt(rate)}" if feeder else f"d_{_fmt(temp)}C"
+            label = stem + (f"_r{k + 1}" if laid > 1 else "")
             labels.append(label)
             specimens.append(Specimen(
-                label=label, value_text=f"{temp:g}\u00b0C",
+                label=label, value_text=(f"feed {rate:g}" if feeder
+                                         else f"{temp:g}\u00b0C"),
                 center=((left + right) / 2.0, ya), size=line_len,
                 feed_mm_min=p.speed))
-            rows.append(dict(
+            row = dict(
                 print=pi, label=label, T_C=temp,
                 anchor="yes" if pi == 1 else "",
                 v_mm_min=p.speed, v_mm_s=round(p.speed / 60.0, 4),
                 pressure_psi=(p.pressure_psi if p.pressure_psi else ""),
                 rep=k + 1, x_start=round(xa, 3), x_end=round(xb, 3),
-                y_mm=round(ya, 3), len_mm=line_len))
+                y_mm=round(ya, 3), len_mm=line_len)
+            if feeder:
+                row["feed_setting"] = rate
+            rows.append(row)
         text = "\n".join(lines) + "\n"
         texts.append(text)
         metas.append(_print_meta(pi, text, labels, p, specimens, base_bbox))
         all_specimens.extend(specimens)
 
-    for m, temp in zip(metas, temps):
+    for m, (temp, rate) in zip(metas, rungs):
         if not m.on_slide:
+            what = f"feeder rate {rate:g}" if feeder else f"{temp:g} degC"
             warnings.append(
-                f"slide {m.index} ({temp:g} degC) exceeds the plate -- shorten "
+                f"slide {m.index} ({what}) exceeds the plate -- shorten "
                 f"the line length or lower the line pitch")
     warnings += _feed_ceiling_warnings(all_specimens[:laid], p.max_feed)
 
@@ -1168,7 +1193,13 @@ def generate_diameter(p: DiamParams) -> SweepResult:
     # "anchor rung" to name -- there is only the one slide. Calling it a ladder
     # on the Viscosity tab is the shared-design wording the split removed
     # everywhere else.
-    if len(temps) == 1:
+    if feeder:
+        summary = (f"feeder plate at {temps[0]:g} degC, {p.speed:.0f} mm/min "
+                   f"({p.speed / 60:.3f} mm/s): {len(rungs)} slide(s), feeder "
+                   f"rate {' -> '.join(f'{r:g}' for _t, r in rungs)}, x "
+                   f"{laid} line(s) @ {line_len:.1f} mm, base "
+                   f"{'ON' if p.stab.enabled else 'OFF'} @ {base_speed:.0f} mm/min")
+    elif len(temps) == 1:
         summary = (f"diameter plate at {temps[0]:g} degC, {p.speed:.0f} mm/min "
                    f"({p.speed / 60:.3f} mm/s): 1 slide x {laid} line(s) @ "
                    f"{line_len:.1f} mm, base "
@@ -1179,14 +1210,17 @@ def generate_diameter(p: DiamParams) -> SweepResult:
                    f"{len(temps)} slide(s) x {laid} line(s) @ {line_len:.1f} mm, "
                    f"anchor rung {temps[0]:g} degC on slide 1, base "
                    f"{'ON' if p.stab.enabled else 'OFF'} @ {base_speed:.0f} mm/min")
-    return SweepResult("diam", _finish_texts(texts, p), _diam_csv(rows), rows,
+    return SweepResult("diam", _finish_texts(texts, p),
+                       _diam_csv(rows, feeder), rows,
                        metas, summary, warnings, oversize)
 
 
-def _diam_csv(rows):
+def _diam_csv(rows, feeder=False):
     cols = ["print", "label", "T_C", "anchor", "v_mm_min", "v_mm_s",
             "pressure_psi", "rep", "x_start", "x_end", "y_mm", "len_mm",
             "d1_mm", "d2_mm", "d3_mm", "d_mean_mm", "soak_min", "notes"]
+    if feeder:      # the feeder plate's slides differ by rate, not by T
+        cols.insert(3, "feed_setting")
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=cols, lineterminator="\r\n")
     w.writeheader()
@@ -3738,14 +3772,16 @@ def _cts4_csv(rows):
 #: one-rung temperature ladder, and which rungs it carries is decided GUI-side by
 #: the tab's own variables (gui_sweeps.py, the `kind in ("diam", "visc")` branch).
 #: They are two kinds rather than one because the two tabs are recalibrated on
-#: different clocks and must not share a design.
+#: different clocks and must not share a design. "feed"
+#: (the feeder plate) is the same generator again, with `feed_rates` set.
 GENERATORS = {"cts": "generate_cts", "lag": "generate_lag",
               "sag": "generate_sag",
               "tube": "generate_lag_tube",
               "cts4": "generate_cts_mandrel",
               "circle": "generate_circles",
               "diam": "generate_diameter",
-              "visc": "generate_diameter"}
+              "visc": "generate_diameter",
+              "feed": "generate_diameter"}
 
 
 def generate(kind, params) -> SweepResult:

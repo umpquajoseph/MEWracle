@@ -630,7 +630,9 @@ class _ScaffoldMixin:
             "Marlin) to the g-code MEWracle saves and shows: where the start "
             "block has [[temperature_command]], else as the first line. The "
             "printer heats the nozzle to that temperature and holds every "
-            "move until it gets there. Unticked, no flavor waits.\n\n"
+            "move until it gets there. Unticked, no flavor waits: "
+            "[[temperature_command]] writes the flavor's Set temperature "
+            "instead (Edit flavors…), or nothing while that row is blank.\n\n"
             "The temperature is the Temperature field on the Physics page, read "
             "when you save. Calibration prints wait too; each slide of a "
             "temperature ladder waits at its own temperature.\n\n"
@@ -1228,7 +1230,10 @@ class _ScaffoldMixin:
             rig_recipes=(self._machine_recipes()
                          if machine_blocks else []),
             layer_markers=bool(machine_blocks
-                               and self.machine_layer_markers.get()))
+                               and self.machine_layer_markers.get()),
+            extrude=(self._extrude_options(
+                gcode_path=self.s_gcode_out.get().strip())
+                if machine_blocks else None))
 
     def _gcode_is_designer_output(self):
         """The g-code in hand is a generator's (a scaffold or a calibration

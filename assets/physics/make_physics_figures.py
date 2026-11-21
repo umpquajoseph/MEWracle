@@ -1305,14 +1305,24 @@ def fig_cts(theme):
 # --------------------------------------------------------------------------- #
 # Process: the rig
 # --------------------------------------------------------------------------- #
-def fig_process(theme):
+def fig_process(theme, feed=False):
+    """The rig. `feed`: a filament printer (Setup › Material delivery's
+    Filament rate or Per line (E)), where a feeder pushes filament in and
+    the flow is what goes in, so the top arrow is the feed, not a pressure,
+    and the temperature only melts it."""
     pn = Panels(theme, 1)
     t = pn.t
+    first = ([("The filament fed in sets the flow: it all comes out as "
+               "fiber.", "hint")] if feed else
+             [(it(r"\Delta P"), "ink"), (" pushes the melt out of the "
+                                         "nozzle.", "hint")])
+    second = ([(it("T"), "ink"), (" melts the filament.", "hint")] if feed
+              else [(it("T"), "ink"), (" sets how runny the melt is.",
+                                       "hint")])
     with pn.panel(0, "What you set for each print",
                   caption=[
-                      [(it(r"\Delta P"), "ink"), (" pushes the melt out of the "
-                                                  "nozzle.", "hint")],
-                      [(it("T"), "ink"), (" sets how runny the melt is.", "hint")],
+                      first,
+                      second,
                       [(it("V"), "ink"), (" is applied from nozzle to collector.",
                                           "hint")],
                       [(it("H"), "ink"), (" is the nozzle tip's height above it.",
@@ -1342,9 +1352,9 @@ def fig_process(theme):
         top = P((0, 0, z_n + 5.2))
         cv.arrow((top[0], top[1] - 26), (top[0], top[1] + 4), lw=1.8,
                  both=False, head=8)
-        cv.rich((top[0] + 12, top[1] - 12), [("pressure ", "ink"),
-                                             (it(r"\Delta P"), "ink")],
-                size=12)
+        cv.rich((top[0] + 12, top[1] - 12),
+                [("filament feed", "ink")] if feed else
+                [("pressure ", "ink"), (it(r"\Delta P"), "ink")], size=12)
         leader((1.18, 0, z_n + 3.05), [("temperature ", "ink"),
                                        (it("T"), "ink")])
         leader((r_n, 0, z_n + 0.8), [("voltage ", "ink"), (it("V"), "ink")])
@@ -1406,6 +1416,9 @@ FIGURES = {
     "material": fig_material,
     "cts": fig_cts,
     "process": fig_process,
+    # the same rig on a filament printer, swapped in by the Process card
+    # (`gui_calibration._apply_feed_mode_ui`)
+    "process_feed": lambda theme: fig_process(theme, feed=True),
     "visual": fig_visual,
 }
 

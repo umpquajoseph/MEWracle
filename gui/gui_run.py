@@ -590,7 +590,7 @@ class _RunMixin:
         How far the axes move and where zero is are not here: they are facts
         to read, in the header and on Setup, not something to act on."""
         accepted = self._preflight_accepted()
-        sp = mew_gcode.process_setpoints(text, flavor)
+        sp = mew_gcode.process_setpoints(text, flavor, self._feed_mode())
         out = {}
         missing = [n for n in ("voltage", "pressure", "temperature")
                    if not sp[n]["written"] and n not in accepted]
@@ -618,7 +618,7 @@ class _RunMixin:
         """The pre-flight's list: one short line per setting the file leaves
         to the printer (`missing`), then the empty End block. The same facts
         `mew_gcode.process_gap_text` gives as a paragraph."""
-        sp = mew_gcode.process_setpoints(text, flavor)
+        sp = mew_gcode.process_setpoints(text, flavor, self._feed_mode())
         fl = mew_gcode.get_flavor(flavor)
         items = []
         no_word = [n for n in missing if n != "temperature"
@@ -628,11 +628,13 @@ class _RunMixin:
         if no_word:
             items.append("%s: set on the printer before you start (%s has "
                          "no command for %s)." % (
-                             " and ".join(no_word).capitalize(), fl.label,
+                             " and ".join(sp[n]["label"] for n in no_word
+                                          ).capitalize(), fl.label,
                              "it" if len(no_word) == 1 else "them"))
         for n in has_word:
-            items.append("%s: not set. Add [[%s_command]] to the start "
-                         "block on Setup's G-code card." % (n.capitalize(), n))
+            items.append("%s: not set. Add [[%s]] to the start block on "
+                         "Setup's G-code card." % (sp[n]["label"].capitalize(),
+                                                   sp[n]["tag"]))
         if "temperature" in missing:
             if fl.heat_wait:
                 items.append("Temperature: set on the printer, or tick “Wait "

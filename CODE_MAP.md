@@ -2945,8 +2945,7 @@ preset carrying `kind="lag"` degrades to the CTS sweep rather than crashing.
   20 layers of 15 um fibre is only 0.285 mm of headroom under a 2 mm span, which
   the card says on screen and `warnings` repeats. The FIT is still the
   single-span `fit_sag_coeff`; the procedure's log-log span EXPONENT and its
-  droop table are not built. GUI: `sw.sag_*` (gui_sweeps `_sw_build_protocol_sag`
-  + `_sw_update_sag_readout`), `_PROTOCOL_NAMES["sag"]`, SECTION_HEADERS
+  droop table are not built. GUI: `sw.sag_*` (gui_sweeps `_sw_build_protocol_sag`), `_PROTOCOL_NAMES["sag"]`, SECTION_HEADERS
   `sag_ladder`. `test_gui_calibration.py` + `test_calibration_procedures.py`.
 - **`generate_lag_tube(LagTubeParams)`** — the SIXTH experiment (2026-09-25), the
   "Lag radii (4-axis)" tab's own print (`print_protocol="tube"`): paper section
@@ -4274,7 +4273,7 @@ unread-move notice, the Save gap) +
 | Physics-deposited export / dynamic diameter | `gui_sim._export_prefix` `:645`/`_sim_play_args` `:664` → `mew_export` → `_FIBER_TRANSFORM` seam |
 | Calibrate the jet model to a rig (tab/profile/fit) | `gui_calibration._build_calibration_tab` → `mew_calibration` (registry + `build_model` + fit fns); worker arg `--calibration <profile.json>` |
 | Accel-limited kinematics | `mew_kinematics.plan_trajectory` `:250`; wired via player `_retime_kinematic` `:2808` |
-| Calibrate a physics value (print → measure → fit → apply), or design a CTS / lag-circle / temperature-ladder calibration print | `analysis/calibration_procedures.py` (the procedure registry — card order + all operator prose) + `gui/gui_calibration.py` (`_build_calibration_page`, `_cal_build_card`, the per-key fits) + `gui/gui_sweeps.py` (`_SweepsMixin` print engine, `SweepPreviewPanel`) + `analysis/mew_sweeps.py` (`generate(kind, params)`, `extract_moves`; three protocols — `"cts"`, `"circle"` and `"diam"`, the temperature ladder the Viscosity and Activation Ea tabs SHARE) + `analysis/mew_circle_fit.py` (`fit_k`) (§2.15); run `test_gui_calibration.py` + `test_calibration_procedures.py` + `test_mew_sweeps.py` + `test_circle_sweep.py` + `test_diam_ladder.py` + `test_ui_shell.py` after |
+| Calibrate a physics value (print → measure → fit → apply), or design a CTS / lag-circle / temperature-ladder calibration print | `analysis/calibration_procedures.py` (the procedure registry — card order + all operator prose) + `gui/gui_calibration.py` (`_build_calibration_page`, `_cal_build_card`, the per-key fits) + `gui/gui_sweeps.py` (`_SweepsMixin` print engine, `SweepPreviewPanel`) + `analysis/mew_sweeps.py` (`generate(kind, params)`, `extract_moves`; three protocols — `"cts"`, `"circle"` and `"diam"`, the temperature ladder the Viscosity and Activation Ea tabs SHARE; the Fiber diameter (filament) tab's feeder plate is `"feed"`, the same generator with `DiamParams.feed_rates`, one file per feeder rate whose start block writes that rate) + `analysis/mew_circle_fit.py` (`fit_k`) (§2.15); run `test_gui_calibration.py` + `test_calibration_procedures.py` + `test_mew_sweeps.py` + `test_circle_sweep.py` + `test_diam_ladder.py` + `test_ui_shell.py` after |
 | Fit the flat lag amplitude k from printed circles | `analysis/mew_circle_fit.py` (`contact_radius` / `amplitude_from_radius` / `commanded_radius` / `fit_k`) (§2.15); the gap it was fitted at is `Calibration.lag_amplitude_gap`; run `test_circle_sweep.py` after |
 
 ---

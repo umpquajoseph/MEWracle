@@ -558,6 +558,9 @@ class _ArgsMixin:
         out = self.out_var.get().strip()
         if out:
             args += ["-o", out]
+        # an opened file is read as the Setup page's printer reads it: its E
+        # rule, and on a filament print the feed it sets, move by move
+        args += self._feed_read_args()
         args += self._mesh_tol_args_for(getattr(self, "mesh_tol", None))
         args += self._sag_solver_args(self.sag_mode, self.sag_mult)
         # Travel deposition is a property of the JET, not of one tab's geometry and
@@ -581,6 +584,11 @@ class _ArgsMixin:
         # mew_export wrapper, which forwards what it does not recognise verbatim.
         args = self._export_prefix("worker:scaffold", "scaffold") + [
                 "--progress", "-o", self.s_gcode_out.get().strip()]
+        if self._feed_mode() == "e":
+            # where each scaffold starts, out of band, so Save writes each
+            # one's own E per mm (`_extrude_options`)
+            args += ["--line-map",
+                     self.s_gcode_out.get().strip() + ".linemap.json"]
         # Add the placement datum to Start X/Y for every scaffold and the
         # stabilization scaffold. The modern shell measures from the plate.
         cdx, cdy = self._scaffold_origin_xy()

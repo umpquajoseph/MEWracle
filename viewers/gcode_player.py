@@ -3832,6 +3832,32 @@ class Player:
             self.deposit_speed = speed
             self._recompute_physics()
 
+    def _feed_mode(self):
+        """The model's melt feed ("pressure" / "speed" / "e"; mew_physics)."""
+        m = getattr(self, "model", None)
+        return getattr(m, "feed_mode", "pressure") if m is not None else "pressure"
+
+    def _feed_hud(self):
+        """The HUD's flow-source text: the pressure, or the filament feed that
+        replaces it (a filament feed never reads the pressure knob)."""
+        mode = self._feed_mode()
+        if mode == "speed":
+            return "feed %g" % self.model.calibration.feed_setting
+        if mode == "e":
+            return "E feed"
+        return "P %.1f psi" % (self.pressure / 6894.76)
+
+    def _feed_row(self):
+        """The readout row for a filament feed, or None under pressure. No
+        knob: the feed is a rig-profile value, set on Setup › Material delivery."""
+        mode = self._feed_mode()
+        if mode == "speed":
+            return {"g": "Process", "k": "Feeder rate",
+                    "v": "%g" % self.model.calibration.feed_setting}
+        if mode == "e":
+            return {"g": "Process", "k": "Feed", "v": "Per line (E)"}
+        return None
+
     # physical floors for the live-editable knobs, so a key-mash can't drive a
     # parameter to a value the model can't take (no negative pressure/voltage; the
     # melt stays above a temperature where the Arrhenius viscosity is meaningful)
@@ -4724,7 +4750,7 @@ class Player:
             if js is not None:
                 lines += [
                     "",
-                    f"V {self.voltage:.1f} kV   P {self.pressure / 6894.76:.1f} psi",
+                    f"V {self.voltage:.1f} kV   {self._feed_hud()}",
                     f"T {self.temperature:.0f} C",
                     vtxt,
                     f"d {d_um:.0f} um",
@@ -4755,9 +4781,10 @@ class Player:
                 rows += [
                     {"g": "Process", "k": "Voltage",
                      "v": f"{self.voltage:.1f} kV", "knob": "voltage"},
-                    {"g": "Process", "k": "Pressure",
-                     "v": "%s %s" % q("pressure", self.pressure / 6894.76, "psi"),
-                     "knob": "pressure"},
+                    (self._feed_row() or
+                     {"g": "Process", "k": "Pressure",
+                      "v": "%s %s" % q("pressure", self.pressure / 6894.76, "psi"),
+                      "knob": "pressure"}),
                     {"g": "Process", "k": "Temperature",
                      "v": f"{self.temperature:.0f} °C", "knob": "temperature"},
                     {"g": "Process", "k": "Speed", "v": spd, "knob": "speed"},
@@ -4780,7 +4807,7 @@ class Player:
                f"speed x{self.speed:g}   xyz=({x:.2f},{y:.2f},{z:.2f}){linestr} ")
         if js is not None:
             txt += ("\n"
-                    f" V={self.voltage:.1f}kV  P={self.pressure / 6894.76:.1f}psi  "
+                    f" V={self.voltage:.1f}kV  {self._feed_hud()}  "
                     f"T={self.temperature:.0f}C  {vtxt} "
                     f"|  d={d_um:.0f}um  "
                     f"CTS={js.critical_speed:.1f}  v/CTS={js.speed_ratio:.2f}  "

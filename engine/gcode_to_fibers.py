@@ -655,8 +655,84 @@ def _finite_word(value, raw):
                          % raw.strip())
 
 
+#: How a controller reads E, absolute or relative (`mew_gcode.Flavor.e_rule`).
+#: "marlin": the last of G90 / G91 / M82 / M83 wins (this reader's rule before
+#: any other was known). "klipper": relative when G91 OR M83 is in force
+#: (klippy/extras/gcode_move.py keeps the two apart). "duet": G90 / G91 never
+#: touch the extruder; only M82 / M83 do.
+E_RULES = ("marlin", "klipper", "duet")
+
+
+class FeedSpec:
+    """A filament-fed print, for reading the fiber's diameter off the file.
+
+    mode   "speed": a feeder driven by a speed command, `word` (OCTO1) with
+           its setting as the first number after it; `rate` mm/min of
+           filament per unit; `setting` the feed before the file sets one.
+           Each printing move draws d = sqrt(4 Q / (pi v)) at its own speed.
+           "e": Per line (E) (`extrude_word`, read as E); each printing
+           move draws d = d_fil sqrt(dE / its length).
+    d_fil  the filament diameter, mm.
+
+    Mass conservation only: solid filament in, solid fiber out."""
+
+    def __init__(self, mode, d_fil, word="", rate=0.0, setting=0.0,
+                 extrude_word="E"):
+        if mode not in ("speed", "e"):
+            raise ValueError("feed mode must be speed or e, got %r" % (mode,))
+        self.mode = mode
+        self.d_fil = float(d_fil)
+        if not self.d_fil > 0.0:
+            raise ValueError("filament diameter must be above 0")
+        self.word = str(word or "").strip().upper()
+        self.rate = float(rate or 0.0)
+        self.setting = float(setting or 0.0)
+        self.extrude_word = str(extrude_word or "E").strip().upper() or "E"
+
+    @classmethod
+    def from_json(cls, text):
+        d = json.loads(text)
+        return cls(d.get("mode"), d.get("d_fil", 1.75), d.get("word", ""),
+                   d.get("rate", 0.0), d.get("setting", 0.0),
+                   d.get("extrude_word", "E"))
+
+    def area(self):
+        return 0.25 * math.pi * self.d_fil ** 2
+
+    def diameter(self, length, e_delta, feed_mm_min, setting):
+        """mm of fiber one printing move lays, or None when it says nothing
+        (a zero-length move, no feed)."""
+        if not length > 1e-9:
+            return None
+        if self.mode == "e":
+            if not e_delta > 0.0:
+                return None
+            return self.d_fil * math.sqrt(e_delta / length)
+        q = self.area() * self.rate * setting        # mm^3/min of melt
+        if not (q > 0.0 and feed_mm_min > 0.0):
+            return None
+        return math.sqrt(4.0 * q / (math.pi * feed_mm_min))
+
+
+def knots_from_moves(moves):
+    """(t_knots, d_knots) for the tube's diameter-vs-time lookup from
+    `moves`, ``(t0, t1, d)`` per printing move: each move's own diameter
+    held across it. None when there are none."""
+    if not moves:
+        return None
+    t, d = [], []
+    for t0, t1, dd in moves:
+        if t and t0 < t[-1]:
+            t0 = t[-1]
+        t1 = max(t1, t0)
+        t += [t0, t1]
+        d += [dd, dd]
+    return np.asarray(t, dtype=np.float64), np.asarray(d, dtype=np.float64)
+
+
 def parse_gcode(path, mode="auto", with_times=False, arc_segments=None,
-                with_travels=False, frame=None, five_axis=None):
+                with_travels=False, frame=None, five_axis=None,
+                e_rule="marlin", feed_spec=None, diam_moves=None):
     """
     Parse a G-code file into a list of polylines (continuous extruding paths).
 
@@ -691,7 +767,22 @@ def parse_gcode(path, mode="auto", with_times=False, arc_segments=None,
     from `frame` on purpose -- the words and the joints belong to the MACHINE,
     the surface only to the frame -- and with it None nothing below changes, so
     a three- or four-axis parse is byte-identical.
+
+    `e_rule` is the controller's reading of E (`E_RULES`); "marlin" is this
+    reader's historical rule. `feed_spec` is a `FeedSpec` for a filament-fed
+    print, and with it `diam_moves` (a list, with `with_times`) receives
+    ``(t0, t1, d)`` for every printing move whose diameter the file sets
+    (`FeedSpec.diameter`), for `knots_from_moves`. A feed of "Per line (E)"
+    also tells a rotary file's E is extrusion, never the split-fed
+    rotary rate. None for both: byte-identical.
     """
+    if e_rule not in E_RULES:
+        raise ValueError("e_rule must be one of %s, got %r"
+                         % (", ".join(E_RULES), e_rule))
+    xword = feed_spec.extrude_word if feed_spec is not None else "E"
+    fword = (feed_spec.word if (feed_spec is not None
+                                and feed_spec.mode == "speed") else "")
+    f_setting = feed_spec.setting if feed_spec is not None else 0.0
     if mode == "auto":
         mode = "e" if file_uses_extrusion(path) else "g1"
     if arc_segments is None:
@@ -795,13 +886,15 @@ def parse_gcode(path, mode="auto", with_times=False, arc_segments=None,
     pre_z = _first_commanded_z(path) if with_travels else None
     z_seen = False
     absolute_xyz = True      # G90 / G91
-    absolute_e = True        # M82 / M83
+    absolute_e = True        # what `e_rule` makes of the two below
+    extrude_abs = True       # M82 / M83
     feed = DEFAULT_FEED      # modal feed (mm/min); only consulted when with_times
     # SPLIT FEEDS (Aerotech) on a mandrel: E is the rotary rate in deg/min and
     # the clock is `rotary_split_seconds`. Switched on by the G75/G76 header the
     # emitter writes, or by the first E word; the flat and five-axis paths
     # never read either, so they are untouched.
-    split_rot = rotary and five is None
+    split_rot = rotary and five is None and not (
+        feed_spec is not None and feed_spec.mode == "e")
     split = False
     rot_feed = None          # deg/min, modal
     per = 1.0                # 60 after G76: F and E are per second
@@ -1006,21 +1099,35 @@ def parse_gcode(path, mode="auto", with_times=False, arc_segments=None,
 
             tokens = line.split()
             code = tokens[0].upper()
+            if xword != "E":
+                # a controller whose extrusion word is not E: read it as E
+                tokens = [tokens[0]] + [
+                    ("E" + t[len(xword):]) if t.upper().startswith(xword)
+                    and t[len(xword):len(xword) + 1] in "+-.0123456789"
+                    and len(t) > len(xword) else t for t in tokens[1:]]
+            if fword and code == fword:
+                # the feeder's speed command: its first number is the setting
+                for t in tokens[1:]:
+                    num = t.split("=", 1)[-1]
+                    try:
+                        f_setting = float(num.lstrip("SsVvPp"))
+                        break
+                    except ValueError:
+                        continue
+                continue
 
             # --- modal state commands ---------------------------------- #
-            if code == "G90":
-                absolute_xyz = True
-                absolute_e = True
-                continue
-            if code == "G91":
-                absolute_xyz = False
-                absolute_e = False
-                continue
-            if code == "M82":
-                absolute_e = True
-                continue
-            if code == "M83":
-                absolute_e = False
+            if code in ("G90", "G91", "M82", "M83"):
+                if code in ("G90", "G91"):
+                    absolute_xyz = code == "G90"
+                    if e_rule == "marlin":
+                        extrude_abs = absolute_xyz
+                else:
+                    extrude_abs = code == "M82"
+                if e_rule == "klipper":
+                    absolute_e = absolute_xyz and extrude_abs
+                else:
+                    absolute_e = extrude_abs
                 continue
             if split_rot and code in ("G75", "G76"):
                 split = True
@@ -1156,11 +1263,17 @@ def parse_gcode(path, mode="auto", with_times=False, arc_segments=None,
                                        else [pos["X"], pos["Y"], pos["Z"]])
                         if with_times:
                             current_t.append(t_cum)
+                    t_start = t_cum
                     t_cum += advance
                     current.append(point(new_pos) if rotary
                                    else [new_pos["X"], new_pos["Y"], new_pos["Z"]])
                     if with_times:
                         current_t.append(t_cum)
+                    if diam_moves is not None and feed_spec is not None:
+                        _dd = feed_spec.diameter(feed_span(pos, new_pos),
+                                                 e_delta, feed, f_setting)
+                        if _dd is not None:
+                            diam_moves.append((t_start, t_cum, _dd))
                 elif mode == "g1":
                     # continuous flow: only a G0 that actually moves is a real
                     # travel. Zero-length G0 markers are stitched through so the
@@ -1264,15 +1377,22 @@ def parse_gcode(path, mode="auto", with_times=False, arc_segments=None,
                         if with_times:
                             current_t.append(t_cum)
                     prevx, prevy = pos["X"], pos["Y"]
+                    t_start, arc_len = t_cum, 0.0
                     for (ax_, ay_) in arc_xy:
                         if with_times:
                             seg_len = math.hypot(ax_ - prevx, ay_ - prevy)
+                            arc_len += seg_len
                             t_cum += (seg_len / (feed / 60.0)
                                       if (seg_len > 1e-12 and feed > 0) else 0.0)
                         current.append([ax_, ay_, new_pos["Z"]])
                         if with_times:
                             current_t.append(t_cum)
                         prevx, prevy = ax_, ay_
+                    if diam_moves is not None and feed_spec is not None:
+                        _dd = feed_spec.diameter(arc_len, e_delta, feed,
+                                                 f_setting)
+                        if _dd is not None:
+                            diam_moves.append((t_start, t_cum, _dd))
                 else:
                     if with_times:
                         prevx, prevy = pos["X"], pos["Y"]
@@ -9109,7 +9229,22 @@ def _main(argv=None):
                     help="JSON list of {name, layers} naming consecutive runs of "
                          "fiber paths; writes a sibling <output>_<name>.stl per "
                          "group as a viewing aid (the whole STL is still written)")
+    # --- filament feed (`FeedSpec`) ---------------------------------------- #
+    ap.add_argument("--e-rule", choices=E_RULES, default="marlin",
+                    help="how the controller reads E, absolute or relative: "
+                         "marlin (last of G90/G91/M82/M83 wins), klipper (G91 "
+                         "or M83 makes it relative), duet (only M82/M83)")
+    ap.add_argument("--feed-spec", default=None,
+                    help="JSON {mode: speed|e, d_fil, word, rate, setting, "
+                         "extrude_word}: a filament-fed print, whose fiber "
+                         "diameter is read off each printing move")
     args = ap.parse_args(argv)
+    try:
+        feed_spec = (FeedSpec.from_json(args.feed_spec) if args.feed_spec
+                     else None)
+    except (ValueError, TypeError, AttributeError) as exc:
+        ap.error("--feed-spec: %s" % exc)
+    diam_moves = [] if feed_spec is not None else None
     if not 0.0 < args.diameter_multiplier < float("inf"):
         ap.error("--diameter-multiplier must be a positive number")
     global TUBE_RADIUS_MULT
@@ -9307,13 +9442,17 @@ def _main(argv=None):
                 paths, ptimes, travels = parse_gcode(
                     args.input, mode=detected, with_times=True,
                     arc_segments=args.arc_segments, with_travels=True,
-                    frame=frame, five_axis=five_reader)
+                    frame=frame, five_axis=five_reader, e_rule=args.e_rule,
+                    feed_spec=feed_spec, diam_moves=diam_moves)
             else:
                 paths, ptimes = parse_gcode(args.input, mode=detected,
                                             with_times=True,
                                             arc_segments=args.arc_segments,
                                             frame=frame,
-                                            five_axis=five_reader)
+                                            five_axis=five_reader,
+                                            e_rule=args.e_rule,
+                                            feed_spec=feed_spec,
+                                            diam_moves=diam_moves)
         except ValueError as exc:
             import mew_frame
             if isinstance(exc, mew_frame.ChartUnusable):
@@ -9378,6 +9517,11 @@ def _main(argv=None):
             # No transform (plain converter / physics deposition off): the travel
             # is still real deposited material, just laid on its commanded line.
             paths, ptimes = merge_travels(paths, ptimes, travels)
+        if diam_by_time is None and diam_moves:
+            # a filament-fed file sets its own diameter, move by move (a
+            # feed change mid-file, Per line (E)); the physics deposition,
+            # when on, has already drawn it from the model instead
+            diam_by_time = knots_from_moves(diam_moves)
 
         # THE SECOND HALF OF THE FIVE-AXIS READ-BACK. `FiveAxisReader` answers
         # in the collector's own XYZ, and on the EXACT solver the rest of the

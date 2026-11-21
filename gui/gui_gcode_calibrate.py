@@ -833,6 +833,11 @@ class _GcodeCalibrateMixin:
         self._cal_picture.tube_map.grid_remove()
         self._cal_build_ribbon()
         self._sw_warn_var.trace_add("write", lambda *_a: self._cal_warnings())
+        # red while the status line shows a calibration warning, plain again
+        # as soon as anything else is written there
+        status = getattr(self, "status", None)
+        if status is not None:
+            status.trace_add("write", lambda *_a: self._cal_status_color())
         # the saved spelling the page shows carries the machine's custom line,
         # which is no reason for the engine to rebuild
         for var in (getattr(self, "custom_gcode", None),
@@ -910,6 +915,8 @@ class _GcodeCalibrateMixin:
     def _cal_type_menu(self):
         m = tk.Menu(self._cal_tools["type"], tearoff=0)
         procs = self._cal_procedures()
+        # every type, in every delivery: a calibration is never hidden (one
+        # the delivery does not use says so in its Instructions)
         for key in self._cal_proc_order:
             m.add_radiobutton(label=procs[key].tab, value=key,
                               variable=self._cal_tab_var)
@@ -1003,14 +1010,40 @@ class _GcodeCalibrateMixin:
                 self._gce_host_close()
             self._cal_sync_doc()
 
+    #: the status line's color while it carries a calibration warning
+    _CAL_WARN_FG = "#c0392b"
+
     def _cal_warnings(self):
-        """The engine's warnings: a specimen dropped off the plate must not
-        hide behind a closed box."""
-        text = self._sw_warn_var.get()
-        if self._cal_print_on() and text:
-            self._gce_notice_show(text, [], kind="calibrate")
-        else:
-            self._gce_notice_hide_if("calibrate")
+        """The engine's warnings and refusals, in the status line at the
+        foot of the window and in red: a specimen dropped off the plate must
+        not hide behind a closed box. Not in the page's notice strip, which
+        pushed the whole page down while a typed value was invalid."""
+        text = self._sw_warn_var.get() if self._cal_print_on() else ""
+        shown = getattr(self, "_cal_warn_shown", "")
+        status = getattr(self, "status", None)
+        if status is None:
+            return
+        if text:
+            self._cal_warn_shown = text
+            status.set(text)
+        elif shown:
+            self._cal_warn_shown = ""
+            if status.get() == shown:
+                status.set("")
+        self._cal_status_color()
+
+    def _cal_status_color(self):
+        """Red while the status line shows the calibration warning."""
+        st = getattr(self, "_shell_status", None)
+        status = getattr(self, "status", None)
+        if st is None or status is None:
+            return
+        shown = getattr(self, "_cal_warn_shown", "")
+        try:
+            st.configure(foreground=self._CAL_WARN_FG
+                         if shown and status.get() == shown else "")
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------------ #
     # the mode
@@ -1074,7 +1107,7 @@ class _GcodeCalibrateMixin:
         if getattr(self, "_last_input_mode", None) == "calibration":
             self._last_input_mode = "gcode"
         self._cal_unload_doc()
-        self._gce_notice_hide_if("calibrate")
+        self._cal_warnings()            # off the status line, and not red
         self._cal_ribbon(False)
         self._cal_nav_refresh()
         self._gce_set_link_label()
@@ -1135,7 +1168,8 @@ class _GcodeCalibrateMixin:
             return
         res = self._sw_result
         kind = self.sw_vars["kind"].get()
-        if res is None or {"visc": "diam"}.get(kind, kind) != res.kind:
+        if res is None or {"visc": "diam", "feed": "diam"}.get(kind, kind) \
+                != res.kind:
             return                      # the last type's, still standing
         if self._cal_stash is not None and self._sw_state.get("dirty"):
             # built from values already changed again: a newer build is on

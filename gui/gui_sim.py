@@ -76,7 +76,13 @@ class _SimMixin:
         duplicating this logic."""
         self.sim_standoff = tk.StringVar(value="4.5")
         self.sim_voltage = tk.StringVar(value="4.0")
-        self.sim_pressure = tk.StringVar(value="3")
+        # the pressure, the fiber diameter to design for and its switch are
+        # also on Setup's Material delivery card, built first: one set of vars
+        delivery = getattr(self, "_delivery_vars", None)
+        if callable(delivery):
+            delivery()
+        else:
+            self.sim_pressure = tk.StringVar(value="3")
         self.sim_temperature = tk.StringVar(value="90" if hosts is None else "80")
         # made earlier by the Material card when that page is built first
         if getattr(self, "sim_polymer", None) is None:
@@ -165,6 +171,11 @@ class _SimMixin:
         for i, v in enumerate(self.scaf_vars):
             v["speed"].trace_add(
                 "write", lambda *_a, idx=i: self._refresh_scaffold_phys_diam(idx))
+            # Filament rate designing for a diameter solves the Feeder rate
+            # at scaffold 1's speed; every scaffold's fiber is on the readout
+            change = getattr(self, "_on_delivery_change", None)
+            if callable(change):
+                v["speed"].trace_add("write", change)
         # set the initial (physics-off) state: override disabled, fields editable
         self._apply_diam_mode()
 
@@ -192,9 +203,15 @@ class _SimMixin:
         F.entry("Voltage", self.sim_voltage,
                 "Nozzle-to-collector voltage. It sets the electric field that "
                 "draws the jet to the collector." + drives, unit="kV")
-        F.entry("Pressure", self.sim_pressure,
-                "Air pressure pushing the melt out of the nozzle. More pressure "
-                "= more flow = thicker fiber." + drives, unit="psi")
+        self._press_row = F.entry(
+            "Pressure", self.sim_pressure,
+            "Air pressure pushing the melt out of the nozzle. More pressure "
+            "= more flow = thicker fiber." + drives, unit="psi")
+        # Filament rate / Per line: the Feeder rate or the fiber diameter in
+        # its place, the same vars as Setup's Material delivery card
+        rows = getattr(self, "_delivery_rows", None)
+        if callable(rows):
+            rows(F, "process")
         F.entry("Temperature", self.sim_temperature,
                 "Melt temperature at the nozzle. Hotter melt is thinner and more "
                 "fluid, so the fiber comes out finer." + drives, unit="°C")
@@ -530,6 +547,8 @@ class _SimMixin:
         return {
             "sim.standoff": self.sim_standoff, "sim.voltage": self.sim_voltage,
             "sim.pressure": self.sim_pressure,
+            "sim.fiber_d": self.sim_fiber_d,
+            "sim.design_d": self.sim_design_d,
             "sim.temperature": self.sim_temperature,
             "sim.polymer": self.sim_polymer,
             "sim.physics_deposit": self.sim_physics_deposit,
@@ -568,7 +587,8 @@ class _SimMixin:
     # before `_build_sim_tab` has created the vars. A new sim.* field must be added here
     # or to `_machine_motion_keys`, or the split silently drifts.
     _PHYSICS_PROCESS_KEYS = (
-        "sim.standoff", "sim.voltage", "sim.pressure", "sim.temperature", "sim.polymer",
+        "sim.standoff", "sim.voltage", "sim.pressure", "sim.fiber_d",
+        "sim.design_d", "sim.temperature", "sim.polymer",
         "sim.physics_deposit", "sim.diam_override",
         "sim.physical_fusion", "sim.sag_law", "sim.taylor_cone",
         "sim.coil_wave", "sim.coil_wave_amp", "sim.coil_wave_len",
@@ -584,7 +604,12 @@ class _SimMixin:
     def _diam_is_physics(self):
         """True when the deposited diameter should be predetermined from physics:
         the Fiber diameter law on (= the manual override off). Independent of
-        Jet lag."""
+        Jet lag.
+
+        Never in E mode: there the diameter you type IS the setting, and Generate
+        writes the E values that make it (`mew_gcode.write_extrusion`)."""
+        if self._feed_mode() == "e":
+            return False
         return not bool(self.sim_diam_override.get())
 
     @staticmethod
@@ -610,15 +635,24 @@ class _SimMixin:
         """JetState for the panel's pressure/temperature (and voltage/elevation)
         at the given scaffold print speed (mm/min -> mm/s), or None if any field is
         blank/garbage. The single place the sim-panel StringVars are read."""
+        filament = self._feed_mode() != "pressure"
         try:
             speed = float(speed_mm_min) / 60.0
-            pressure_pa = float(self.sim_pressure.get()) * PSI_TO_PA
+            try:
+                pressure_pa = float(self.sim_pressure.get()) * PSI_TO_PA
+            except ValueError:
+                if not filament:   # a filament feed never reads the pressure
+                    raise
+                pressure_pa = 0.0
             temp = float(self.sim_temperature.get())
             volt = float(self.sim_voltage.get())
             gap = float(self.sim_standoff.get())
         except (ValueError, tk.TclError, AttributeError):
             return None
-        return self._solve_jet_with_calibration(pressure_pa, temp, speed, volt, gap)
+        st = self._solve_jet_with_calibration(pressure_pa, temp, speed, volt, gap)
+        if st is not None and filament and not st.flow_rate > 0.0:
+            return None            # feeder stopped (setting 0): no fiber to show
+        return st
 
     def _solve_jet_with_calibration(self, pressure_pa, temperature_c, speed_mm_s,
                                     voltage_kv, gap_mm):
@@ -666,6 +700,7 @@ class _SimMixin:
         self._apply_kinematics_mode()
         self._apply_coil_wave_mode()
         physics = self._diam_is_physics()
+        target = self._diam_is_target()
         for i, v in enumerate(self.scaf_vars):
             # Scaffold 1's diameter has THREE entries: the planar geometry
             # grid's, the 4-axis grid's and the 5-axis grid's. Same variable, so
@@ -675,6 +710,10 @@ class _SimMixin:
             if physics:
                 self._manual_diam.setdefault(i, v["diameter"].get())
                 self._refresh_scaffold_phys_diam(i)
+                for entry in entries:
+                    self._set_entry_state(entry, "disabled")
+            elif target:
+                self._manual_diam.setdefault(i, v["diameter"].get())
                 for entry in entries:
                     self._set_entry_state(entry, "disabled")
             else:
@@ -690,14 +729,68 @@ class _SimMixin:
         # the G-code window generating at the old one under a greyed field.
         manual = self.__dict__.setdefault("_manual_page_diam", {})
         for v in self._phys_page_scaffolds():
-            if physics:
+            if physics or target:
                 manual.setdefault(id(v), v["diameter"].get())
-                self._refresh_phys_diam_of(v)
+                if physics:
+                    self._refresh_phys_diam_of(v)
             elif id(v) in manual:
                 v["diameter"].set(manual.pop(id(v)))
+        if target:
+            self._push_target_diam()
         for entry, btn in getattr(self, "_diam_links", ()):
-            self._place_diam_link(entry, btn, physics)
+            self._place_diam_link(entry, btn, physics or target)
+            try:
+                btn.configure(
+                    text=("From Material delivery →" if target
+                          else "From Physics →"),
+                    command=(self._goto_delivery if target
+                             else self._goto_diam_override))
+            except tk.TclError:
+                pass
         self._update_phys_readout()
+
+    def _diam_is_target(self):
+        """True when every scaffold prints at the Material delivery card's
+        Fiber diameter: Per line (E), where the diameter you type IS the
+        setting and Generate writes the E that makes it."""
+        return self._feed_mode() == "e"
+
+    def _push_target_diam(self):
+        """Per line (E): write the typed Fiber diameter into every scaffold,
+        the Design page's and the G-code window's, whose fields stay greyed
+        (`_apply_diam_mode`)."""
+        if not self._diam_is_target() or getattr(self, "_loading_preset",
+                                                 False):
+            return
+        try:
+            text = self.sim_fiber_d.get().strip()
+            if not float(text) > 0.0:
+                return
+        except (AttributeError, ValueError, tk.TclError):
+            return
+        for v in list(self.scaf_vars) + self._phys_page_scaffolds():
+            try:
+                if v["diameter"].get() != text:
+                    v["diameter"].set(text)
+            except (KeyError, tk.TclError):
+                pass
+
+    def _goto_delivery(self, at="fiber"):
+        """Open Setup › Printer & collector at the Material delivery card,
+        on its Fiber diameter row (`at="fiber"`) or its feed test
+        (`at="feed_test"`, the Calibrate feeder type's lead link)."""
+        import gui_finder
+        want = getattr(self, "_delivery_%s_entry" % at, None)
+        for hit in gui_finder.index(self):
+            if hit.widget is want:
+                self.reveal_control(hit)
+                return
+        page = getattr(self, "_machine_page", None)
+        grid = getattr(self, "_machine_grid", None)
+        if page is not None:
+            self.goto_page(page)
+        if grid is not None:
+            grid.open("feed")
 
     # -- the "From Physics" jump beside a greyed diameter field ------------- #
     def _diam_link(self, entry):
@@ -721,8 +814,8 @@ class _SimMixin:
             entry.master, text="From Physics →", style="Link.TButton",
             command=self._goto_diam_override), "button")
         gui_tips.Tooltip(btn, (
-            "The Physics page predicts this diameter from pressure, "
-            "temperature and print speed. Click to open its Fiber diameter "
+            "The Physics page predicts this diameter from the melt flow "
+            "and print speed. Click to open its Fiber diameter "
             "card, where ‘Override fiber diameter’ lets you type "
             "it here instead."))
         # Hidden until `_apply_diam_mode` runs: the scaffold grids are built
@@ -851,6 +944,7 @@ class _SimMixin:
         except (KeyError, AttributeError, tk.TclError):
             return
         self._refresh_phys_diam_of(v)
+        self._push_target_diam()
 
     def _update_phys_readout(self):
         """Refresh the sim-panel readout listing each ACTIVE scaffold's predetermined
@@ -860,6 +954,7 @@ class _SimMixin:
         if lbl is None:
             return
         overriding = bool(self.sim_diam_override.get())
+        mode = self._feed_mode()
         header = ("Override is on. Physics Ø, for reference:"
                   if overriding
                   else "Computed fiber Ø (mass conservation):")
@@ -867,13 +962,33 @@ class _SimMixin:
             n = self._scaffold_count()
         except Exception:  # noqa: BLE001
             n = 1
+        if mode == "e":
+            # Per line (E): the typed diameter IS the setting, so the
+            # readout says what Generate writes for it rather than predicting.
+            lines = ["Per line (E): the diameter you type is written as E."]
+            for i in range(min(n, len(self.scaf_vars))):
+                v = self.scaf_vars[i]
+                try:
+                    d = float(v["diameter"].get())
+                except (ValueError, tk.TclError):
+                    d = None
+                r = self._feed_e_per_mm(d) if d else None
+                d_txt = (gui_units.show("fiber_d", "%.4g" % d, "mm")
+                         if d else "—")
+                lines.append(f"  Scaffold {i + 1}: {d_txt}, "
+                             + (f"{r:.4g} mm of filament per mm" if r
+                                else "— (set the filament diameter)"))
+            lbl.configure(text=chr(10).join(lines))
+            return
+        missing = ("set the Feeder rate and speed" if mode == "speed"
+                   else "set the pressure, temperature and speed")
         lines = [header]
         for i in range(min(n, len(self.scaf_vars))):
             v = self.scaf_vars[i]
             spd = v["speed"].get().strip()
             st = self._jet_for_scaffold_speed(v["speed"].get())
             if st is None:
-                lines.append(f"  Scaffold {i + 1}: — (set the pressure, temperature and speed)")
+                lines.append(f"  Scaffold {i + 1}: — ({missing})")
             else:
                 note = "" if st.straight_fibre else "  (below CTS)"
                 d = gui_units.show("fiber_d", "%.4g" % st.fiber_diameter, "mm")
@@ -1084,10 +1199,11 @@ class _SimMixin:
                 ("Voltage (kV)", "sim_voltage", "ge0"),
                 ("Pressure (%s)" % press_unit, "sim_pressure", "ge0"),
                 ("Temperature (°C)", "sim_temperature", "abs0"))
+        filament = self._feed_mode() != "pressure"
         for label, attr, rule in rows:
             var = getattr(self, attr, None)
-            if var is None:
-                continue
+            if var is None or (filament and attr == "sim_pressure"):
+                continue   # a filament feed does not read the pressure
             raw = str(var.get()).strip()
             if attr == "sim_pressure" and press_unit != "psi":
                 raw = gui_units.convert_text(raw, "pressure", "psi", press_unit)

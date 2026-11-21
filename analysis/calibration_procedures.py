@@ -183,6 +183,9 @@ SECTION_HEADERS: dict[str, dict[str, str]] = {
                 fit_inputs="Span (mm)",),
     # fusion shows no print tiles at all, so it names none of the shared ones
     "fusion": dict(fit_inputs="Layers N",),
+    "feeder": dict(_SHARED_PRINT_HEADERS,
+                   feed_conditions="Print conditions",
+                   fit_inputs="Feeder rate",),
 }
 
 
@@ -410,8 +413,7 @@ _VISCOSITY = Procedure(
             "“Nozzle–collector gap (mm)” on the “Process parameters” card. "
             "The anchor you measure holds only at those settings.",
             "Set “Print temperature (°C)” to the temperature you want the "
-            "anchor at, and “Print feed (mm/min)” to any speed above the CTS. "
-            "The line under the heading says whether it clears.",
+            "anchor at, and “Print feed (mm/min)” to any speed above the CTS.",
             "Set “Lines on the slide” to how many fibers you want to measure.",
         )),
         (PRINT, (
@@ -563,8 +565,8 @@ _LAG3 = Procedure(
             "On Setup > Physics, open “Process parameters” and set "
             "“Nozzle–collector gap (mm)” to the gap you will print at.",
             "Open Calibrate and pick “Jet lag (plate)” from the “Type” menu.",
-            "Read the “Conditions” line. Check that the gap it prints is the "
-            "gap you just set.",
+            "The amplitude this print yields holds only at that gap, so print "
+            "at the gap you work at.",
             "Leave the “Specimens” table as it opens: speed ratios of 2, 3, 4 "
             "and 6, two repeats each. A speed ratio is the print speed divided "
             "by the critical translation speed.",
@@ -630,8 +632,8 @@ _LAG3 = Procedure(
         )),
     ),
     settings_notes={
-        "conditions": (4, "A read-only line: the gap, the radii and the insets "
-                          "this plate will use."),
+        "conditions": (4, "The plate is laid at the gap set on the Physics "
+                          "page, and the amplitude it yields holds only there."),
         "specimens": (5, "One row per circle: its speed ratio, how many repeats "
                          "of it, and the radius it will be given."),
         "specimen_size": (7, "The sizing dial and the starting A the sizing "
@@ -974,6 +976,102 @@ _FUSION = Procedure(
 )
 
 
+# source: mew_physics `MEWModel.feed_rate_per_unit` / `feed_flow` (filament
+#   mm/min per unit of the speed command; Q = filament area x feed speed, mass
+#   conservation); mew_calibration FEED_FIELDS ("Use a measured value"); the
+#   filament-feed spec (2026-11-16): two methods, a feed test with no print
+#   (mark the filament, run e.g. OCTO1 20000 for 10 minutes, measure how far
+#   it went) and a printed line measured under a microscope. The feed test has
+#   no print, so it is not a Calibrate type: it lives on Setup's Material
+#   delivery card (gui_calibration `_apply_feed_test`), and this type's
+#   Instructions open with a link to it (`LEAD_LINKS`). The line is
+#   the feeder plate (`mew_sweeps.generate_diameter` with `feed_rates`):
+#   one temperature and one speed, since neither enters a filament
+#   print's diameter, and an optional slide at twice the rate as a slip
+#   check (2026-11-16).
+_FEEDER = Procedure(
+    key="feeder",
+    title="Fiber diameter on a filament printer",
+    tab="Fiber diameter (filament)",
+    calibrates=(
+        "This writes how fast the filament feeder pushes filament per unit of "
+        "its Feeder rate, in mm of filament per minute. MEWracle can work it "
+        "out from the gears on Setup › Printer & collector › Material delivery, "
+        "but a measured value is better: it holds whatever the gearbox, the "
+        "drive gear and the stepper driver really do. It is only for a feeder "
+        "run at a filament rate (OCTO1 on a MEWron). The print is one slide of "
+        "lines at your Feeder rate, plus an optional second slide at twice the "
+        "rate that shows whether the feeder gear slips."
+    ),
+    print_protocol="feed",
+    groups=(
+        (SETUP, (
+            "Open Calibrate and pick “Fiber diameter (filament)” from the "
+            "“Type” menu.",
+            "On Setup › Printer & collector › Material delivery, pick “Filament "
+            "rate”.",
+            "Under “Print conditions”, set “Feeder rate” to the rate you print "
+            "scaffolds at. Tick “Slip check at twice the rate” if you want a "
+            "second slide that shows whether the feeder gear slips. Set "
+            "“Print temperature (°C)” to what you print at, and “Print feed "
+            "(mm/min)” to a speed above the CTS so the lines lay straight.",
+            "Set “Lines on each slide” to how many fibers you want to measure.",
+        )),
+        (PRINT, (
+            "Press “Generate”, then “Save g-code as…” and pick a folder. With "
+            "the slip check on, each slide is its own file, and each file’s "
+            "start block sets its own Feeder rate.",
+            "Set the nozzle to your print temperature and print the slide. "
+            "With the slip check on, swap the glass slide and print the "
+            "second file, which runs the feeder at twice the rate. The "
+            "stabilization scaffold at the start of each file lets the flow "
+            "settle at the new rate before the lines.",
+        )),
+        (MEASURE, (
+            "Measure every line’s diameter in {fiber_d}, under a microscope "
+            "calibrated on a stage micrometer. Keep slide 1’s and slide 2’s "
+            "apart.",
+        )),
+        (APPLY, (
+            "Under “Enter your measurements”, check that “Feeder rate” and "
+            "“Print speed” match what you printed. They are filled in from "
+            "the plate you designed. Type slide 1’s diameters into “Slide 1 "
+            "fiber Ø”, and slide 2’s, if you printed it, into “Slide 2 fiber "
+            "Ø”.",
+            "Press “Compute”. “Measurements” shows the feed per unit, in mm "
+            "of filament per minute, and whether slide 2 agrees with slide 1.",
+            "Press “Apply” on the ribbon. It ticks “Use a measured value” on "
+            "the Material delivery card and fills in the number.",
+            "The feeder is the printer’s, so it is kept with the printer "
+            "preset: save it under “Presets” on Setup › Printer & collector "
+            "to keep it for the next start.",
+        )),
+    ),
+    settings_notes={
+        "feed_conditions": (3, "The Feeder rate, the slip check, the one "
+                               "temperature and the one speed the lines are "
+                               "printed at, and how many lines each slide "
+                               "gets."),
+        "fit_inputs": (9, "The Feeder rate and speed you printed at, then one "
+                          "cell per line on each slide."),
+        "plate_feed_limit": (5, _LADDER_SHARED["plate_feed_limit"]),
+        "stabilization_base": (5, _LADDER_SHARED["stabilization_base"]),
+        "preview_options": (5, _LADDER_SHARED["preview_options"]),
+        "experiment_presets": (5, "Saves this plate design so you can run it "
+                                  "again unchanged."),
+        "export_options": (5, "An optional measurement-CSV template for this "
+                              "plate, off by default."),
+        "target_slide": (5, "Slide 1 is at your Feeder rate; slide 2, when "
+                            "the slip check is on, at twice it. Each is its "
+                            "own file."),
+    },
+    measure=(
+        "Every line’s diameter, in {fiber_d}, on each slide, printed at a "
+        "Feeder rate and speed you know."
+    ),
+)
+
+
 #: The tabs, in the order the Calibration page renders them. Insertion order IS
 #: tab order.
 PROCEDURES: dict[str, Procedure] = {
@@ -986,5 +1084,56 @@ PROCEDURES: dict[str, Procedure] = {
         _LAG4,
         _SAG,
         _FUSION,
+        _FEEDER,
     )
+}
+
+#: A link drawn as the FIRST line of a type's Instructions, in bold link blue:
+#: (text, where). "delivery" opens Setup › Printer & collector at the Material
+#: delivery card. The feeder type's is there so nobody prints a calibration
+#: plate for a value the feed test gives with no print.
+LEAD_LINKS = {
+    "feeder": ("Run a feed test instead of the calibration print", "delivery"),
+}
+
+#: Per line (E) trusts the firmware to move 1 mm of filament per unit of E,
+#: so the check is the printer's, not a MEWracle value. M200 (volumetric E,
+#: mm^3) is Marlin / RepRapFirmware / Smoothie; Klipper does not list it.
+#: M221 (flow %) is in Marlin and Klipper. Shown on the Material delivery
+#: card under Per line (E) and in the feeder type's Per line note.
+E_MODE_CHECK = (
+    "Per line (E) assumes 1 E moves 1 mm of filament. Before you print, check "
+    "the extruder is not in volumetric mode (M200 on Marlin or RepRapFirmware "
+    "turns E into mm³), the flow is 100 % (M221), and the extruder is "
+    "calibrated (rotation_distance in Klipper, steps per mm in Marlin): mark "
+    "the filament, extrude 100 mm, and the mark should move 100 mm.")
+
+#: What a type's value does NOT do under a material delivery
+#: (`Calibration.feed_mode`), said at the top of its Instructions. Every type
+#: stays on the Type menu in every delivery: a calibration is never hidden.
+#: A filament print's diameter is mass conservation, so the melt viscosity and
+#: its temperature dependence do not set it; the feeder's own value is used
+#: only under Filament rate.
+_FILAMENT_VISC = ("Your printer delivers by %s, so this value does not "
+                  "change the predicted fiber diameter: that comes from how "
+                  "much filament is fed. It is used when Setup › Polymer "
+                  "delivery is set to Pressure.")
+DELIVERY_NOTES = {
+    "pressure": {
+        "feeder": ("Your printer delivers by Pressure, so the feeder value "
+                   "is not used. It is used when Setup › Material delivery is "
+                   "set to Filament rate."),
+    },
+    "speed": {
+        "viscosity": _FILAMENT_VISC % "Filament rate",
+        "activation_energy": _FILAMENT_VISC % "Filament rate",
+    },
+    "e": {
+        "viscosity": _FILAMENT_VISC % "Per line (E)",
+        "activation_energy": _FILAMENT_VISC % "Per line (E)",
+        "feeder": ("Your printer delivers by Per line (E), which moves the "
+                   "filament by E, so the feeder value is not used. It is "
+                   "used when Setup › Material delivery is set to Filament "
+                   "rate. " + E_MODE_CHECK),
+    },
 }

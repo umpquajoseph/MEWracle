@@ -3083,9 +3083,19 @@ class _GcodeChangesMixin:
                                  what="custom"))
         else:
             fields = next(f for k, _l, f in eng.INSERT_FORMS if k == kind)
+            values = {n: d for n, _l, _u, d in fields if d is not None}
+            if "celsius" in values:
+                # Wait for / Set temperature start at this print's own
+                # temperature (Physics › Process parameters), not the
+                # engine's placeholder
+                try:
+                    t = float(self.sim_temperature.get())
+                    if t > 0.0:
+                        values["celsius"] = t
+                except (AttributeError, ValueError, tk.TclError):
+                    pass
             try:
-                c = m.insert_command(kind, anchor, **{
-                    n: d for n, _l, _u, d in fields if d is not None})
+                c = m.insert_command(kind, anchor, **values)
             except Exception as exc:  # noqa: BLE001 -- the flavor has none
                 self.gce.end_group(keep=False)
                 self._gce_status(str(exc))

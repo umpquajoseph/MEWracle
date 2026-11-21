@@ -41,7 +41,7 @@ import math
 
 from mew_physics import (
     Material, Nozzle, Calibration, MEWModel,
-    GAS_CONSTANT, CELSIUS_TO_KELVIN,
+    GAS_CONSTANT, CELSIUS_TO_KELVIN, FEED_MODES,
 )
 
 # Every profile key is namespaced so the flat dict (and the GUI persist map /
@@ -367,7 +367,76 @@ DORMANT_CALIBRATION_ATTRS = frozenset({
     # unreachable. Do NOT "fix" this by inventing a dict-valued FieldSpec: that
     # fires the Lite parity guard by design and drags Lite's Physics form along.
     "law_source", "law_consts",
+    # The MELT FEED (2026-11-16): live and user-facing, on Setup's Polymer
+    # delivery card and Physics › Process parameters, but in `FEED_FIELDS` + `FEED_MODE_KEY` +
+    # `FEED_E_KEY` rather than CALIBRATION_FIELDS, for the Lite-mirror reason
+    # the law keys give (Lite has no filament feed yet). `models_from_profile`
+    # reads all three, so nothing here is unreachable.
+    "feed_mode", "filament_diameter", "feed_setting", "feed_unit_steps",
+    "feed_microsteps", "feed_full_steps", "feed_motor_gearbox",
+    "feed_gear_ratio", "feed_rotation_distance", "feed_rate_measured",
+    "feed_e_per_mm",
 })
+
+# --------------------------------------------------------------------------- #
+# The melt feed (`Calibration.feed_*`): a registry of its own, same FieldSpec
+# shape and the same profile keys (`cal.<attr>`), so the GUI creates, persists
+# and ships them exactly like a CALIBRATION_FIELDS entry.
+# --------------------------------------------------------------------------- #
+FEED_SECTION = "Filament feeder"
+FEED_FIELDS = [
+    FieldSpec("filament_diameter", "calibration", "Filament diameter", "mm",
+              FEED_SECTION, "required",
+              "The diameter of the filament you feed. Measure it with calipers: "
+              "it enters the flow squared."),
+    FieldSpec("feed_setting", "calibration", "Feeder rate", "",
+              FEED_SECTION, "required",
+              "The number your speed command sends, e.g. the 600 in OCTO1 600. "
+              "It is a motor speed, held until the next command."),
+    FieldSpec("feed_motor_gearbox", "calibration", "Motor gearbox ratio", ": 1",
+              FEED_SECTION, "required",
+              "The gearbox bolted to the feeder motor, if any (1 for none). "
+              "A PG27 motor is about 26.85."),
+    FieldSpec("feed_gear_ratio", "calibration", "Drive gear ratio", ": 1",
+              FEED_SECTION, "required",
+              "The extruder's own gearing, Klipper's gear_ratio (50:10 = 5)."),
+    FieldSpec("feed_rotation_distance", "calibration", "Rotation distance", "mm",
+              FEED_SECTION, "required",
+              "Filament moved per turn of the drive gear, Klipper's "
+              "rotation_distance."),
+    FieldSpec("feed_microsteps", "calibration", "Microsteps", "",
+              FEED_SECTION, "advanced",
+              "Microsteps per full step the driver runs at (the MEWron's "
+              "speed.py sets 256)."),
+    FieldSpec("feed_full_steps", "calibration", "Steps per revolution", "",
+              FEED_SECTION, "advanced",
+              "Full steps per motor turn: 200 for a 1.8° motor, 400 for 0.9°."),
+    FieldSpec("feed_unit_steps", "calibration", "Driver steps per unit", "/s",
+              FEED_SECTION, "advanced",
+              "Microsteps per second one unit of the command makes. A TMC2209 "
+              "in VACTUAL mode: 12 MHz / 2^24 = 0.715."),
+    FieldSpec("feed_rate_measured", "calibration", "Measured feed per unit",
+              "mm/min", FEED_SECTION, "required",
+              "Filament mm/min per unit of the command, from Calibrate's "
+              "Fiber diameter (filament) type. Set, it replaces the gear-train calculation.",
+              optional=True, gate_label="Use a measured value"),
+]
+_BY_KEY.update({fs.key: fs for fs in FEED_FIELDS})
+
+#: The feed mode ("pressure" / "speed" / "e") and E mode's nominal filament
+#: per mm. Strings / derived values, so not FieldSpecs; `models_from_profile`
+#: reads them explicitly, as it does the law keys.
+FEED_MODE_KEY = KEY_PREFIX + "feed_mode"
+FEED_E_KEY = KEY_PREFIX + "feed_e_per_mm"
+
+#: The feed keys that describe the PRINTER -- how it pushes the melt, its
+#: filament, its feeder's drive train -- and so ride the MACHINE preset
+#: (Setup › Printer & collector › Material delivery). Only the Feeder rate, the
+#: number a print is run at, rides the physics preset with the pressure.
+MACHINE_FEED_KEYS = frozenset(
+    [FEED_MODE_KEY]
+    + [fs.key for fs in FEED_FIELDS if fs.attr != "feed_setting"]
+    + [fs.gate_key for fs in FEED_FIELDS if fs.gate_label])
 
 
 def fmt_value(value) -> str:
@@ -605,6 +674,15 @@ def models_from_profile(profile: dict):
             profile.get(LAW_SOURCE_KEY))
         over["calibration"]["law_consts"] = _law_dict(
             profile.get(LAW_CONSTS_KEY), values_are_numbers=True)
+        mode = str(profile.get(FEED_MODE_KEY) or "").strip().lower()
+        if mode in FEED_MODES:
+            over["calibration"]["feed_mode"] = mode
+        try:
+            e_per_mm = float(profile.get(FEED_E_KEY) or 0.0)
+        except (TypeError, ValueError):
+            e_per_mm = 0.0
+        if math.isfinite(e_per_mm) and e_per_mm > 0.0:
+            over["calibration"]["feed_e_per_mm"] = e_per_mm
     material = dataclasses.replace(Material(), **over["material"])
     nozzle = dataclasses.replace(Nozzle(), **over["nozzle"])
     calibration = dataclasses.replace(Calibration(), **over["calibration"])

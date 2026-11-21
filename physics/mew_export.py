@@ -213,12 +213,6 @@ def main(argv=None):
         sys.stderr.write("mew_export: --temperature must be above absolute "
                          "zero (-273.15 degC)\n")
         return 2
-    if known.dynamic_diameter and known.pressure <= 0.0:
-        # no melt flows at or below zero gauge pressure, so a physics-driven
-        # diameter would be a 0 um fibre
-        sys.stderr.write("mew_export: --pressure must be positive for a "
-                         "physics-driven diameter (Pa)\n")
-        return 2
 
     # Build the jet model from the rig calibration profile (Material / Nozzle /
     # Calibration anchors + hooks), or the factory defaults when no --calibration
@@ -229,6 +223,14 @@ def main(argv=None):
     model = mew_calibration.build_model(
         known.calibration, known.standoff, viscous=known.physical_sag_viscous,
         per_layer_registration=known.mandrel_per_layer)
+    if (known.dynamic_diameter and model.feed_mode == "pressure"
+            and known.pressure <= 0.0):
+        # no melt flows at or below zero gauge pressure, so a physics-driven
+        # diameter would be a 0 um fibre. A filament feed takes its flow from
+        # the profile's feed and never reads --pressure.
+        sys.stderr.write("mew_export: --pressure must be positive for a "
+                         "physics-driven diameter (Pa)\n")
+        return 2
     zeta = (known.zeta if known.zeta is not None
             else model.calibration.contact_damping_zeta)
     transform = make_transform(

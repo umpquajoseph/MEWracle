@@ -600,6 +600,15 @@ class _ModernThemeMixin:
         style.map("Link.TButton",
                   background=[("pressed", bg), ("active", bg)],
                   foreground=[("disabled", disabled)])
+        # the same link in bold: a line that must be read before anything
+        # else, e.g. a Calibrate type's "Run a feed test instead of the
+        # calibration print" (calibration_procedures.LEAD_LINKS)
+        style.configure("LinkBold.TButton", font="MewSection", padding=(0, 2),
+                        background=bg, foreground=sel_bg, borderwidth=0,
+                        relief="flat", focuscolor=bg, anchor="w")
+        style.map("LinkBold.TButton",
+                  background=[("pressed", bg), ("active", bg)],
+                  foreground=[("disabled", disabled)])
 
         # sidebar
         style.configure("Sidebar.TFrame", background=sidebar)

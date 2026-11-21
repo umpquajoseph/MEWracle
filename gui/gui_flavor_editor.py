@@ -36,6 +36,7 @@ from gui_tips import add_tip
 
 #: rows that pick from a fixed list, with the list
 _CHOICES = {"dwell_unit": ("ms", "s", ""), "rotary_feed": ("combined", "split"),
+            "e_rule": mew_gcode.E_RULES,
             "line_numbers": ("off", "on")}
 _LABELS = {f: (lab, ex) for f, lab, ex in mew_gcode.FLAVOR_FIELDS}
 
@@ -145,7 +146,7 @@ class FlavorEditor:
         ttk.Label(right, textvariable=self.banner_var, style="Hint.TLabel",
                   wraplength=640, justify="left").grid(row=0, column=0,
                                                        sticky="w")
-        sf = VScrollFrame(right)
+        sf = self._scroll = VScrollFrame(right)
         sf.grid(row=1, column=0, sticky="nsew", pady=(gui_fonts.SP["s"], 0))
         body = sf.body
         body.columnconfigure(1, weight=1)
@@ -217,6 +218,24 @@ class FlavorEditor:
             w.bind("<KP_Enter>", lambda _e: self.save())
         self.vars[name] = var
         self.widgets[name] = w
+
+    def focus_field(self, name):
+        """Scroll to the row `name` and put the cursor in it: Setup's Polymer
+        delivery card opens the editor at the command it is about."""
+        w = self.widgets.get(name)
+        if w is None:
+            return
+        try:
+            self.top.update_idletasks()
+            body = w.master
+            h = max(1, body.winfo_height())
+            self._scroll._canvas.yview_moveto(
+                max(0.0, (w.winfo_y() - 60) / float(h)))
+            w.focus_set()
+            if isinstance(w, ttk.Entry):
+                w.select_range(0, "end")
+        except (tk.TclError, AttributeError):
+            pass
 
     def alive(self):
         try:

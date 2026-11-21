@@ -875,8 +875,9 @@ class _BuildPlateMixin:
                "all of them). Use [[pressure_command]], [[voltage_command]] or "
                "[[temperature_command]] for the selected flavor's setpoints; a "
                "flavor with none prints no line. [[temperature_command]] is "
-               "the flavor's heat wait, written only while \"Wait to print "
-               "until target temperature is reached\" is ticked. [[layer]] "
+               "the flavor's Heat and wait while \"Wait to print until "
+               "target temperature is reached\" is ticked, and its Set "
+               "temperature while it is not. [[layer]] "
                "and [[z]] belong to scripts, not to this block.")
         if hasattr(self, "_build_header_notes_row"):
             self._build_header_notes_row(F)
@@ -1111,6 +1112,20 @@ class _BuildPlateMixin:
             spacing, rotation = each("stepover"), rotations()
             collector = "flat plate"
         zero = self._gcode_zero_short()
+        # the melt feed: the pressure line on an air-fed print, the feed
+        # line on a filament-fed one, never both (`_feed_mode`)
+        mode = self._feed_mode()
+        pressure = val("sim_pressure") if mode == "pressure" else na
+        if mode == "speed":
+            fv = getattr(self, "cal_vars", {}).get("cal.feed_setting")
+            try:
+                feed = "%g" % float(fv.get()) if fv is not None else ""
+            except (ValueError, tk.TclError):
+                feed = ""
+        elif mode == "e":
+            feed = "Per line (E)"
+        else:
+            feed = na
 
         def wait_on():
             var = getattr(self, "s_wait_for_temp", None)
@@ -1136,7 +1151,8 @@ class _BuildPlateMixin:
                 "spacing": spacing, "layers": each("layers"),
                 "rotation": rotation, "scaffold_count": str(len(groups)),
                 "winding_angle": winding, "scaffold_length": length,
-                "pressure": val("sim_pressure"), "voltage": val("sim_voltage"),
+                "pressure": pressure, "feed": feed,
+                "voltage": val("sim_voltage"),
                 "temperature": val("sim_temperature"), "gap": val("sim_standoff"),
                 "speed": each("speed"), "nozzle": nozzle_text,
                 "polymer": val("sim_polymer"),
@@ -1154,7 +1170,8 @@ class _BuildPlateMixin:
         note = tk.StringVar(value="")
         busy = {"on": False}
         keys = ("voltage", "pressure", "temperature", "end")
-        words = {"voltage": "the voltage", "pressure": "the pressure",
+        words = {"voltage": "the voltage",
+                 "pressure": "the pressure or filament feed",
                  "temperature": "the temperature", "end": "an empty End block"}
 
         def from_saved(*_a):
@@ -1501,6 +1518,10 @@ class _BuildPlateMixin:
         hook = getattr(self, "_gce_flavors_changed", None)
         if callable(hook):
             hook(renamed or {}, deleted, edited)
+        # ... and the Material delivery card's command lines
+        cmds = getattr(self, "_refresh_delivery_commands", None)
+        if callable(cmds):
+            cmds()
         # a flavor that gained a pressure or voltage word changes what the
         # header writes and what the card warns is left out
         paint = getattr(self, "_header_preview_paint", None)
@@ -3913,6 +3934,15 @@ class _BuildPlateMixin:
         # ... and the process limits (pressure / speed / melt temperature)
         # Fiber target judges against: rig facts on the Printer model card
         keys.extend(getattr(self, "_ft_machine_keys", tuple)())
+        # ... and the melt feed: pressure or a filament feeder, and the
+        # feeder's filament and drive train (`MACHINE_FEED_KEYS`)
+        try:
+            import mew_calibration
+            have = getattr(self, "cal_vars", {})
+            keys.extend(k for k in sorted(mew_calibration.MACHINE_FEED_KEYS)
+                        if k in have)
+        except ImportError:
+            pass
         return keys
 
     # -- CLI-arg builders --------------------------------------------------- #

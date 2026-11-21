@@ -454,6 +454,47 @@ class Calibration:
     # the frozen terms.
     mandrel_per_layer_registration: bool = False   # OFF = one placement per scaffold at the bare radius (§12.8). ON = re-evaluate on each grown layer
 
+    # -- MELT FEED: where the flow Q comes from ------------------------------ #
+    # "pressure" is a pneumatic syringe and Q is Hagen-Poiseuille (`flow_rate`).
+    # The two FILAMENT modes are positive displacement: the feeder pushes a
+    # known volume of solid filament in and, with nothing evaporating or
+    # leaking, the same volume leaves as fiber. So Q = (pi/4) d_fil^2 v_feed by
+    # mass conservation alone -- no viscosity, needle or pressure enters it,
+    # and solid filament in / solid fiber out means density cancels too.
+    #
+    #   "speed"  a speed-command feeder (the MEWron's `OCTO1 N`, Reizabal 2023
+    #            §2.3): N is a motor SPEED, held until the next command, so Q is
+    #            constant and faster printing makes a thinner fiber -- the same
+    #            behaviour as pressure, from a different source.
+    #   "e"      an E-axis feeder (Marlin / Klipper / RRF): E is filament
+    #            POSITION and the firmware moves it in step with XY on every
+    #            move, so the fiber is d_fil * sqrt(E per mm of path) at any
+    #            speed. Q then rides the speed; `feed_e_per_mm` is the print's
+    #            nominal ratio (the GUI writes it from the design's diameter).
+    #
+    # These are rig-profile values rather than ProcessParams knobs for the
+    # reason `working_distance` is model state: constant within a print, and
+    # carried by the one profile every model build and every worker already
+    # reads. Not `CALIBRATION_FIELDS` entries -- `mew_calibration.FEED_FIELDS`,
+    # for the Lite-mirror reason given under the law keys below.
+    feed_mode: str = "pressure"          # "pressure" | "speed" | "e"
+    filament_diameter: float = 1.75      # mm. MEASURE it: d enters Q squared, so a 3% error is 6% in Q and 3% in d
+    feed_setting: float = 1000.0         # the speed-command number (OCTO1 N), units of the command. 1000 = the Calibrate feeder plate's default rate
+    # The speed-command factor: filament mm/min per unit of N. Computed from
+    # the drive train unless `feed_rate_measured` is set. The defaults are the
+    # MEWron of Reizabal 2023 (§2.3: "an approximate 80:1" train on a Voron 0.1,
+    # 1.75 mm filament, a TMC2209 in VACTUAL mode): with them this formula gives
+    # 20.6 / 137 / 686 uL/h at the paper's E = 600 / 4000 / 20000 against its
+    # stated ~20 / ~135 / ~675 -- within 2%.
+    feed_unit_steps: float = 12.0e6 / 2 ** 24   # driver microsteps/s per unit of N. TMC2209 VACTUAL: f_clk/2^24 at its internal 12 MHz clock (driver-library figure; the datasheet's clock tolerance is UNREAD, so measure)
+    feed_microsteps: float = 256.0       # microsteps per full step (MEWron speed.py sets 256)
+    feed_full_steps: float = 200.0       # full steps per motor revolution (1.8 deg = 200)
+    feed_motor_gearbox: float = 16.0     # the gearbox bolted to the motor, input:output (Reizabal's 80:1 = 16 x the 50:10 below)
+    feed_gear_ratio: float = 5.0         # the extruder's own gear ratio (Mini Afterburner 50:10 = 5), Klipper `gear_ratio`
+    feed_rotation_distance: float = 22.67  # mm of filament per drive-gear revolution, Klipper `rotation_distance`
+    feed_rate_measured: float | None = None  # mm/min of filament per unit of N, MEASURED (Calibrate's Fiber diameter (filament)). Set -> overrides the drive train
+    feed_e_per_mm: float = 0.0           # E mode: mm of filament per mm of fiber, the print's nominal (= (d/d_fil)^2)
+
     # -- USER-REPLACED LAWS (mew_lawlang) ---------------------------------- #
     # `law_source` maps a law key from `mew_lawlang.LAWS` to the user's own
     # expression for it; `law_consts` maps the same key to that user's named
@@ -539,6 +580,9 @@ class JetState:
 #: The fraction above CTS that `MEWModel.min_print_speed` floors a slowed
 #: five-axis feed at. See that method for why it is 10% and not 0.
 CTS_FLOOR_MARGIN = 1.10
+
+#: `Calibration.feed_mode`'s values, in the order Setup › Material delivery offers them.
+FEED_MODES = ("pressure", "speed", "e")
 
 
 class MEWModel:
@@ -769,12 +813,16 @@ class MEWModel:
                      else self.material.temperature_ref)
             ref = self.viscosity(float(t_ref))
             val = (self.viscosity(float(temp)) / ref) if ref else None
-        elif name == "Q" and temp is not None and press is not None:
-            val = self.flow_rate(float(press), float(temp))
+        elif name == "Q" and (self.feed_mode != "pressure"
+                              or (temp is not None and press is not None)):
+            val = self.flow_rate(float(press or 0.0), float(temp or 0.0),
+                                 speed=speed)
         elif name == "d" and speed is not None and float(speed) > 0.0:
             q = env.get("Q")
-            if q is None and temp is not None and press is not None:
-                q = self.flow_rate(float(press), float(temp))
+            if q is None and (self.feed_mode != "pressure"
+                              or (temp is not None and press is not None)):
+                q = self.flow_rate(float(press or 0.0), float(temp or 0.0),
+                                   speed=speed)
             if q is not None:
                 val = self.fiber_diameter(float(q), float(speed))
         elif name == "CTS":
@@ -817,9 +865,86 @@ class MEWModel:
         return m.viscosity_ref * math.exp(
             m.activation_energy / GAS_CONSTANT * (1.0 / t - 1.0 / t_ref))
 
-    def flow_rate(self, pressure_pa: float, temperature_c: float) -> float:
-        """Volumetric melt flow Qv through the needle, mm^3/s -- Hagen-Poiseuille
-        Qv = pi r^4 dP / (8 eta(T) L) ([S4]).
+    # -- the filament feed (Calibration.feed_mode != "pressure") ------------ #
+    @property
+    def feed_mode(self) -> str:
+        """"pressure", "speed" or "e" -- where `flow_rate` takes Q from."""
+        mode = str(self.calibration.feed_mode or "pressure").strip().lower()
+        return mode if mode in FEED_MODES else "pressure"
+
+    def filament_area(self) -> float:
+        """Cross-section of the feedstock filament, mm^2 (= uL per mm fed)."""
+        d = self.calibration.filament_diameter
+        if not (math.isfinite(d) and d > 0.0):
+            raise ValueError("filament diameter must be a positive number (mm), "
+                             "got %r" % (d,))
+        return 0.25 * math.pi * d * d
+
+    def feed_rate_per_unit(self) -> float:
+        """Filament feed, mm/min, per unit of the speed command (OCTO1 N).
+
+        `feed_rate_measured` when it is set; otherwise the drive train:
+        microsteps/s per unit / (microsteps x full steps) = motor rev/s, over the
+        two reductions = drive-gear rev/s, times the rotation distance = mm/s.
+        Every one of those is the same number the rig's printer.cfg / speed.py
+        carries, so nothing here is fitted."""
+        cal = self.calibration
+        if cal.feed_rate_measured is not None:
+            val = float(cal.feed_rate_measured)
+            if not (math.isfinite(val) and val > 0.0):
+                raise ValueError("the measured feed rate must be a positive "
+                                 "number (mm/min per unit), got %r" % (val,))
+            return val
+        parts = (("driver steps per unit", cal.feed_unit_steps),
+                 ("microsteps", cal.feed_microsteps),
+                 ("steps per revolution", cal.feed_full_steps),
+                 ("motor gearbox ratio", cal.feed_motor_gearbox),
+                 ("drive gear ratio", cal.feed_gear_ratio),
+                 ("rotation distance", cal.feed_rotation_distance))
+        for what, val in parts:
+            if not (math.isfinite(val) and val > 0.0):
+                raise ValueError("feeder %s must be a positive number, got %r"
+                                 % (what, val))
+        rev_s = cal.feed_unit_steps / (cal.feed_microsteps * cal.feed_full_steps)
+        return (rev_s / (cal.feed_motor_gearbox * cal.feed_gear_ratio)
+                * cal.feed_rotation_distance * 60.0)
+
+    def feed_flow(self, setting: float | None = None) -> float:
+        """Q, mm^3/s, of a speed-command feeder at `setting` (default: the
+        profile's `feed_setting`). Mass conservation: filament area x feed speed.
+        The sign of N is a direction only on the MEWron, so a negative setting
+        is no flow, as a pressure at or below ambient is."""
+        n = self.calibration.feed_setting if setting is None else setting
+        if not math.isfinite(n) or n <= 0.0:
+            return 0.0
+        return self.filament_area() * n * self.feed_rate_per_unit() / 60.0
+
+    def feed_setting_for(self, flow_rate: float) -> float:
+        """The speed-command number that gives `flow_rate` (mm^3/s): the exact
+        inverse of `feed_flow`, which is linear in N."""
+        per = self.filament_area() * self.feed_rate_per_unit() / 60.0
+        return flow_rate / per
+
+    def e_per_mm_for(self, diameter: float) -> float:
+        """E mode: mm of filament per mm of fiber for a `diameter` mm fiber --
+        equal volumes, so (d / d_fil)^2."""
+        d_fil = self.calibration.filament_diameter
+        if not (math.isfinite(d_fil) and d_fil > 0.0):
+            raise ValueError("filament diameter must be a positive number (mm)")
+        return (diameter / d_fil) ** 2
+
+    def flow_rate(self, pressure_pa: float, temperature_c: float,
+                  speed: float | None = None) -> float:
+        """Volumetric melt flow Qv, mm^3/s.
+
+        PRESSURE mode (the default): through the needle by Hagen-Poiseuille,
+        Qv = pi r^4 dP / (8 eta(T) L) ([S4]). FILAMENT modes: mass conservation
+        of the fed filament, and pressure and temperature do not enter --
+        "speed" is `feed_flow`, "e" is (pi/4) d_fil^2 * feed_e_per_mm * v at
+        `speed` (the context speed, then CTS, when none is given: an E-axis
+        feed has no single flow, only a filament-per-mm ratio).
+
+        The pressure-mode notes:
 
         Computed in SI then converted. Pressure at or below ambient yields no flow
         rather than a negative number.
@@ -838,7 +963,20 @@ class MEWModel:
         rather than left for it to recompute, so a replaced viscosity law reaches a
         replaced flow law with no second seam to keep in step. The zero-pressure
         guard is inside the law's own expression, not in front of it: a user who
-        writes a flow law with a start threshold owns that decision."""
+        writes a flow law with a start threshold owns that decision. A replaced
+        flow law is a PRESSURE law, so a filament mode never runs it."""
+        mode = self.feed_mode
+        if mode == "speed":
+            return self.feed_flow()
+        if mode == "e":
+            v = speed if speed is not None else self.context.get("speed")
+            if v is None:
+                v = self.calibration.cts_ref
+            r = self.calibration.feed_e_per_mm
+            if not (math.isfinite(r) and r > 0.0 and math.isfinite(v)
+                    and v > 0.0):
+                return 0.0
+            return self.filament_area() * r * float(v)
         eta = self.viscosity(temperature_c)
         fn = self._law("flow")
         if fn is not None:
@@ -862,6 +1000,13 @@ class MEWModel:
         caveat lives at [S16]/[S3]."""
         if speed <= 0.0:
             raise ValueError("speed must be positive (mm/s)")
+        if self.feed_mode == "e" and self.calibration.feed_e_per_mm > 0.0:
+            # The firmware moves E in step with the head, so Q rides the speed
+            # and d = sqrt(4Q/pi v) = d_fil sqrt(E per mm) at every speed: the
+            # speed cancels. Evaluated directly so a caller holding a Q from
+            # another speed still gets the E-file's fiber.
+            return (self.calibration.filament_diameter
+                    * math.sqrt(self.calibration.feed_e_per_mm))
         fn = self._law("diameter")
         if fn is not None:
             return fn(self._law_scope("diameter", Q=float(flow_rate),
@@ -1380,7 +1525,8 @@ class MEWModel:
                          temperature=params.temperature,
                          gap=self.working_distance, speed=params.speed)
 
-        qv = self.flow_rate(params.pressure, params.temperature)
+        qv = self.flow_rate(params.pressure, params.temperature,
+                            speed=params.speed)
         eta = self.viscosity(params.temperature)
         cts = self.critical_speed(params.voltage, self.working_distance,
                                   flow_rate=qv, viscosity=eta)

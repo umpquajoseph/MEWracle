@@ -43,6 +43,10 @@ HEADLINE_SECTIONS = (
         ("s.speed", "Print speed"),
         ("cal.cts_ref", "Critical translation speed (CTS)"),
         ("sim.pressure", "Applied pressure"),
+        # the melt feed: "pressure", or a filament feeder's "speed" command
+        # (with its setting) or "e" (Per line (E))
+        ("cal.feed_mode", "Material delivery"),
+        ("cal.feed_setting", "Feeder rate"),
         ("sim.voltage", "Voltage"),
         ("sim.standoff", "Nozzle–collector gap"),
         ("sim.temperature", "Temperature"),
